@@ -326,6 +326,8 @@ export const EN_MESSAGES = {
   'settings.playback': 'Playback',
   'settings.livePreview': 'Live preview',
   'settings.livePreviewHint': 'Watch live channels in a small window while you browse.',
+  'settings.fixPictureShape': 'Fix stretched widescreen video',
+  'settings.fixPictureShapeHint': 'Shows widescreen films at their real shape when a stream wrongly tells the TV to stretch them to fill the screen.',
   'settings.autoPlay': 'Play the last watched channel on startup',
   'settings.channelCycleMode': 'Channel Up/Down',
   'settings.channelCycleModeHint': 'Global cycles the entire channel list. Active stays within the group, Favorites, or playlist a channel was tuned from, and returns to Global if that view becomes empty.',

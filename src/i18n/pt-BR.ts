@@ -324,6 +324,8 @@ export const PT_BR_MESSAGES = {
   'settings.playback': 'Reprodução',
   'settings.livePreview': 'Prévia ao vivo',
   'settings.livePreviewHint': 'Assista a canais ao vivo em uma janela pequena enquanto navega.',
+  'settings.fixPictureShape': 'Corrigir vídeo widescreen esticado',
+  'settings.fixPictureShapeHint': 'Mostra filmes widescreen no formato real quando uma transmissão pede por engano à TV que os estique para preencher a tela.',
   'settings.autoPlay': 'Reproduzir o último canal assistido ao iniciar',
   'settings.channelCycleMode': 'Canal +/−',
   'settings.channelCycleModeHint': 'Em “Todos os canais”, as teclas Canal +/− percorrem a lista inteira. “Lista de origem” limita a troca de canal ao grupo, aos Favoritos ou à playlist em que a reprodução foi iniciada. Se essa lista ficar vazia, “Todos os canais” será usado automaticamente.',

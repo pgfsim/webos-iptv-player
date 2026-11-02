@@ -272,6 +272,15 @@ describe('StorageService', () => {
     expect(StorageService.getAutoPlay()).toBe(false);
   });
 
+  it('fixes stretched widescreen video until it is switched off', () => {
+    expect(StorageService.getFixPictureShape()).toBe(true);
+    StorageService.setFixPictureShape(false);
+    expect(localStorage.getItem('iptv_fix_picture_shape')).toBe('false');
+    expect(StorageService.getFixPictureShape()).toBe(false);
+    StorageService.setFixPictureShape(true);
+    expect(StorageService.getFixPictureShape()).toBe(true);
+  });
+
   it.each(['null', '"true"', '1', '{}', 'invalid'])(
     'keeps live preview off for a malformed stored preference %s',
     (value) => {

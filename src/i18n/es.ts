@@ -324,6 +324,8 @@ export const ES_MESSAGES = {
   'settings.playback': 'Reproducción',
   'settings.livePreview': 'Vista previa en directo',
   'settings.livePreviewHint': 'Mira canales en directo en una ventana pequeña mientras navegas.',
+  'settings.fixPictureShape': 'Corregir vídeo panorámico estirado',
+  'settings.fixPictureShapeHint': 'Muestra las películas panorámicas con su forma real cuando una emisión indica por error al televisor que las estire para llenar la pantalla.',
   'settings.autoPlay': 'Reproducir el último canal visto al iniciar',
   'settings.channelCycleMode': 'Canal +/−',
   'settings.channelCycleModeHint': 'Con «Todos los canales», las teclas Canal +/− recorren toda la lista. «Vista de origen» limita el cambio al grupo, a Favoritos o a la lista de reproducción desde la que se inició la reproducción. Si esa vista queda vacía, se usa automáticamente «Todos los canales».',

@@ -743,6 +743,7 @@ export class Settings {
     const epgSources = this.epgSources(manualEpgSources, allPlaylists);
     const autoPlay = StorageService.getAutoPlay();
     const livePreview = StorageService.getLivePreview();
+    const fixPictureShape = StorageService.getFixPictureShape();
     const channelCycleMode = StorageService.getChannelCycleMode();
     const showHidden = StorageService.getShowHiddenChannels();
     const hideArabic = StorageService.getHideArabic();
@@ -997,6 +998,11 @@ export class Settings {
                   <div class="settings-item-title">${t('settings.livePreview')}</div>
                   ${toggleGroup('live-preview-setting', [{ value: 'on', label: t('settings.on') }, { value: 'off', label: t('settings.off') }], livePreview ? 'on' : 'off')}
                   <div class="settings-item-hint">${t('settings.livePreviewHint')}</div>
+                </div>
+                <div class="settings-item">
+                  <div class="settings-item-title">${t('settings.fixPictureShape')}</div>
+                  ${toggleGroup('fix-picture-shape', [{ value: 'on', label: t('settings.on') }, { value: 'off', label: t('settings.off') }], fixPictureShape ? 'on' : 'off')}
+                  <div class="settings-item-hint">${t('settings.fixPictureShapeHint')}</div>
                 </div>
                 <div class="settings-item">
                   <div class="settings-item-title">${t('settings.channelCycleMode')}</div>
@@ -2866,6 +2872,8 @@ export class Settings {
 
     const livePreviewBtn = $('#live-preview-setting .toggle-option.active', this.container);
     if (livePreviewBtn) StorageService.setLivePreview(livePreviewBtn.dataset.value === 'on');
+    const fixPictureShapeBtn = $('#fix-picture-shape .toggle-option.active', this.container);
+    if (fixPictureShapeBtn) StorageService.setFixPictureShape(fixPictureShapeBtn.dataset.value === 'on');
 
     const channelCycleBtn = $('#channel-cycle-mode .toggle-option.active', this.container);
     if (channelCycleBtn?.dataset.value) {

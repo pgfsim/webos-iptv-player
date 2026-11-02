@@ -324,6 +324,8 @@ export const FR_MESSAGES = {
   'settings.playback': 'Lecture',
   'settings.livePreview': 'Aperçu en direct',
   'settings.livePreviewHint': 'Regardez les chaînes en direct dans une petite fenêtre pendant que vous naviguez.',
+  'settings.fixPictureShape': 'Corriger la vidéo panoramique étirée',
+  'settings.fixPictureShapeHint': 'Affiche les films panoramiques dans leur vraie forme quand un flux demande à tort au téléviseur de les étirer pour remplir l’écran.',
   'settings.autoPlay': 'Lire la dernière chaîne regardée au démarrage',
   'settings.channelCycleMode': 'Chaîne +/−',
   'settings.channelCycleModeHint': 'En mode « Toutes les chaînes », les touches Chaîne +/− parcourent toute la liste. « Vue d’origine » limite le changement de chaîne à la vue depuis laquelle la lecture a commencé : groupe, Favoris ou liste de lecture. Si cette vue devient vide, le mode « Toutes les chaînes » est utilisé automatiquement.',

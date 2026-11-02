@@ -1099,6 +1099,13 @@ export const StorageService = {
     set('live_preview', val);
   },
 
+  getFixPictureShape(): boolean {
+    return get<unknown>('fix_picture_shape', true) !== false;
+  },
+  setFixPictureShape(fix: boolean): void {
+    set('fix_picture_shape', fix);
+  },
+
   getAnimationMode(): AnimationMode {
     const mode = get<unknown>('animation_mode', DEFAULT_ANIMATION_MODE);
     return isAnimationMode(mode) ? mode : DEFAULT_ANIMATION_MODE;

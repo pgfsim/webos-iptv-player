@@ -336,6 +336,8 @@ export const PL_MESSAGES = {
   'settings.playback': 'Odtwarzanie',
   'settings.livePreview': 'Podgląd na żywo',
   'settings.livePreviewHint': 'Oglądaj kanał w małym oknie podczas przeglądania.',
+  'settings.fixPictureShape': 'Popraw rozciągnięte wideo panoramiczne',
+  'settings.fixPictureShapeHint': 'Pokazuje filmy panoramiczne w ich prawdziwych proporcjach, gdy strumień błędnie każe telewizorowi rozciągnąć je na cały ekran.',
   'settings.autoPlay': 'Odtwarzaj ostatnio oglądany kanał po uruchomieniu',
   'settings.channelCycleMode': 'Kanał +/−',
   'settings.channelCycleModeHint': 'Tryb globalny przełącza kanały na całej liście. Tryb „Aktywny widok” ogranicza przełączanie do bieżącej grupy, Ulubionych lub playlisty, z której włączono kanał. Jeśli ten widok jest pusty, aplikacja przechodzi do trybu globalnego.',

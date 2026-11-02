@@ -318,6 +318,8 @@ export const ZH_CN_MESSAGES = {
   'settings.playback': '播放',
   'settings.livePreview': '直播预览',
   'settings.livePreviewHint': '浏览时在小窗口中观看直播频道。',
+  'settings.fixPictureShape': '修正被拉伸的宽银幕视频',
+  'settings.fixPictureShapeHint': '当视频流错误地让电视将宽银幕电影拉伸至全屏时，按其真实比例显示。',
   'settings.autoPlay': '启动时播放上次观看的频道',
   'settings.channelCycleMode': '频道上/下键',
   'settings.channelCycleModeHint': '“所有频道”按完整频道列表切换；“当前列表”只在开始播放时所在的分组、收藏或播放列表中切换。当前列表为空时，自动切换到所有频道。',
