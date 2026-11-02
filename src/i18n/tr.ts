@@ -318,6 +318,8 @@ export const TR_MESSAGES = {
   'settings.playback': 'Oynatma',
   'settings.livePreview': 'Canlı ön izleme',
   'settings.livePreviewHint': 'Gezinirken canlı kanalı küçük bir pencerede izleyin.',
+  'settings.fixPictureShape': 'Gerilmiş geniş ekran videoyu düzelt',
+  'settings.fixPictureShapeHint': 'Bir yayın televizyona geniş ekran filmleri ekranı dolduracak şekilde germesini yanlışlıkla söylediğinde onları gerçek oranlarında gösterir.',
   'settings.autoPlay': 'Başlangıçta son izlenen kanalı oynat',
   'settings.channelCycleMode': 'Kanal Yukarı/Aşağı',
   'settings.channelCycleModeHint': 'Genel, tüm kanal listesinde gezinir. Etkin, kanalın açıldığı grup, Favoriler veya oynatma listesiyle sınırlıdır; görünüm boşalırsa Genel’e döner.',

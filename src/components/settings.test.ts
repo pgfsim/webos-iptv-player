@@ -112,6 +112,8 @@ const {
       getShowHiddenChannels: vi.fn(() => state.showHidden),
       getHideArabic: vi.fn(() => false),
       setHideArabic: vi.fn(),
+      getFixPictureShape: vi.fn(() => true),
+      setFixPictureShape: vi.fn(),
       setShowHiddenChannels: vi.fn((v: boolean) => { state.showHidden = v; }),
       getChannelCustomization: vi.fn(() => null),
       setChannelCustomization: vi.fn(),
@@ -1476,6 +1478,15 @@ describe('Settings Recently Watched clearing', () => {
     click('#hide-arabic [data-value="on"]');
     click('#save-settings');
     expect(storageMock.setHideArabic).toHaveBeenLastCalledWith(true);
+    expect(onSave).toHaveBeenLastCalledWith('apply');
+  });
+
+  it('saves the stretched widescreen video switch', () => {
+    settings.render();
+    expect(container.querySelector('#fix-picture-shape .toggle-option.active')?.getAttribute('data-value')).toBe('on');
+    click('#fix-picture-shape [data-value="off"]');
+    click('#save-settings');
+    expect(storageMock.setFixPictureShape).toHaveBeenLastCalledWith(false);
     expect(onSave).toHaveBeenLastCalledWith('apply');
   });
 

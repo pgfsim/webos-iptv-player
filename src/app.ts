@@ -59,6 +59,7 @@ import { withoutGuideOff } from './utils/guide-sources';
 import { preloadSearchCatalog } from './services/xtream-catalog';
 import { FocusRing } from './navigation/focus-ring';
 import { Focus, type FocusScope } from './navigation/focus-scope';
+import { PictureShapeFix } from './services/picture-shape';
 import type {
   Action,
   NumberEvent,
@@ -116,6 +117,7 @@ class App {
   private epgChannelReloadTimer: ReturnType<typeof setTimeout> | null = null;
   private searchCatalogPreloadTimer: ReturnType<typeof setTimeout> | null = null;
   private hideArabic = StorageService.getHideArabic();
+  private pictureShape: PictureShapeFix | null = null;
   private readonly searchPrewarm = new SearchIndexPrewarmer(() => this.searchPrewarmSources());
 
   async init(): Promise<void> {
@@ -230,6 +232,8 @@ class App {
     );
 
     this.player.init($('#video-player') as HTMLVideoElement);
+    this.pictureShape = new PictureShapeFix(() => this.player.getVideoElement(), StorageService.getFixPictureShape());
+    this.pictureShape.start();
     this.livePreview = new LivePreview($('#live-preview')!, {
       channelView: this.views.channels,
       player: this.player,
@@ -1921,6 +1925,7 @@ class App {
       return;
     }
     if (action === 'guide') this.reloadGuide();
+    if (action !== 'cancel') this.pictureShape?.setEnabled(StorageService.getFixPictureShape());
     if (action !== 'cancel' && StorageService.getHideArabic() !== this.hideArabic) {
       this.hideArabic = StorageService.getHideArabic();
       // Hidden titles leave every list the way concealed ones do.

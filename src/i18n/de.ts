@@ -324,6 +324,8 @@ export const DE_MESSAGES = {
   'settings.playback': 'Wiedergabe',
   'settings.livePreview': 'Live-Vorschau',
   'settings.livePreviewHint': 'Sehen Sie Live-Sender in einem kleinen Fenster, während Sie stöbern.',
+  'settings.fixPictureShape': 'Gestrecktes Breitbildvideo korrigieren',
+  'settings.fixPictureShapeHint': 'Zeigt Breitbildfilme in ihrer echten Form, wenn ein Stream den Fernseher fälschlich anweist, sie auf den ganzen Bildschirm zu strecken.',
   'settings.autoPlay': 'Beim Start den zuletzt angesehenen Sender abspielen',
   'settings.channelCycleMode': 'Sender +/−',
   'settings.channelCycleModeHint': 'Bei „Alle Sender“ wechseln die Tasten Sender +/− durch die gesamte Senderliste. „Ausgangsansicht“ beschränkt den Wechsel auf die Gruppe, die Favoriten oder die Playlist, aus der die Wiedergabe gestartet wurde. Wird diese Ansicht leer, wird automatisch „Alle Sender“ verwendet.',

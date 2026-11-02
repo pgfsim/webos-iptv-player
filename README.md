@@ -92,6 +92,22 @@ is separate from parental controls: there is no PIN, and unlocking does not
 show these items. Switching it filters what is already loaded and downloads
 nothing.
 
+### Fix stretched widescreen video
+
+Some streams send a widescreen film at its real shape, for example
+1920×800, but carry a wrong pixel-shape flag (such as 20:27) that tells the
+TV to stretch it to 16:9. The TV obeys, so everyone looks too tall. CSS
+cannot fix this, because webOS draws native video on its own plane.
+
+**Settings → Playback → Fix stretched widescreen video** (on by default)
+watches the TV's video output (`com.webos.service.videooutput`). When an HD
+picture, 1280 pixels wide or more, is flagged with pixels taller than wide,
+the app asks the TV to draw it at its real shape, centered with black bars.
+It works in the Live preview too, and stops after 5 corrections in 10
+seconds if the TV keeps resetting the window. Standard-definition pictures,
+genuinely wide pixels such as 1440×1080 HD, and normal streams are left
+alone. Switching it off gives the picture back to the TV at once.
+
 ## Screenshots
 
 | Channel list | Live preview |
