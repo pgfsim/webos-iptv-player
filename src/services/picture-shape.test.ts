@@ -52,16 +52,21 @@ describe('correctedWindow', () => {
 describe('PictureShapeFix', () => {
   let calls: Array<{ uri: string; payload: Record<string, unknown> }>;
   let statusCallback: ((message: string) => void) | null;
+  let currentStatus: VideoOutputEntry | null;
 
   beforeEach(() => {
     calls = [];
     statusCallback = null;
+    currentStatus = null;
     class FakeBridge {
       onservicecallback: ((message: string) => void) | null = null;
       call(uri: string, payload: string): void {
         calls.push({ uri, payload: JSON.parse(payload) });
-        if (uri.endsWith('/getStatus')) statusCallback = message => this.onservicecallback?.(message);
-        else this.onservicecallback?.(JSON.stringify({ returnValue: true }));
+        if (uri.endsWith('/getStatus') && JSON.parse(payload).subscribe) {
+          statusCallback = message => this.onservicecallback?.(message);
+        } else if (uri.endsWith('/getStatus')) {
+          this.onservicecallback?.(JSON.stringify({ returnValue: true, video: currentStatus ? [currentStatus] : [] }));
+        } else this.onservicecallback?.(JSON.stringify({ returnValue: true }));
       }
       cancel(): void {}
     }
@@ -86,7 +91,7 @@ describe('PictureShapeFix', () => {
 
   it('corrects the playing video and logs it once', () => {
     const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
-    new PictureShapeFix(video(), true).start();
+    new PictureShapeFix(() => video(), true).start();
     expect(calls[0].payload).toEqual({ subscribe: true });
     sendStatus(stretchedFilm());
     sendStatus(stretchedFilm());
@@ -101,14 +106,45 @@ describe('PictureShapeFix', () => {
     expect(events).toHaveLength(1);
   });
 
+  it('checks again once the element exposes the new mediaId', () => {
+    const el = video() as HTMLVideoElement & { mediaId?: string };
+    el.mediaId = 'old';
+    document.body.appendChild(el);
+    new PictureShapeFix(() => el, true).start();
+    currentStatus = stretchedFilm({ context: 'm2' });
+    sendStatus(currentStatus);
+    expect(windowCalls()).toHaveLength(0);
+    el.mediaId = 'm2';
+    el.dispatchEvent(new Event('loadedmetadata'));
+    expect(windowCalls()).toHaveLength(1);
+    expect(windowCalls()[0].payload).toMatchObject({ context: 'm2' });
+    el.remove();
+  });
+
+  it('follows a video element the player swaps in', () => {
+    const first = video();
+    document.body.appendChild(first);
+    let current: HTMLVideoElement = first;
+    new PictureShapeFix(() => current, true).start();
+    const fresh = video() as HTMLVideoElement & { mediaId?: string };
+    fresh.mediaId = 'm3';
+    first.replaceWith(fresh);
+    current = fresh;
+    currentStatus = stretchedFilm({ context: 'm3' });
+    fresh.dispatchEvent(new Event('loadedmetadata'));
+    expect(windowCalls()).toHaveLength(1);
+    expect(windowCalls()[0].payload).toMatchObject({ context: 'm3' });
+    fresh.remove();
+  });
+
   it('stops re-correcting a TV that keeps resetting the window', () => {
-    new PictureShapeFix(video(), true).start();
+    new PictureShapeFix(() => video(), true).start();
     for (let i = 0; i < 10; i++) sendStatus(stretchedFilm());
     expect(windowCalls()).toHaveLength(5);
   });
 
   it('ignores another app\'s video and does nothing while off', () => {
-    const fix = new PictureShapeFix(video(), false);
+    const fix = new PictureShapeFix(() => video(), false);
     fix.start();
     sendStatus(stretchedFilm());
     sendStatus(stretchedFilm({ context: 'other' }));
@@ -118,7 +154,7 @@ describe('PictureShapeFix', () => {
   });
 
   it('gives the whole window back when switched off', () => {
-    const fix = new PictureShapeFix(video(), true);
+    const fix = new PictureShapeFix(() => video(), true);
     fix.start();
     sendStatus(stretchedFilm());
     fix.setEnabled(false);

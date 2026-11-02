@@ -69,7 +69,13 @@ export class PictureShapeFix {
   private corrections: number[] = [];
   private reported = new Set<string>();
 
-  constructor(private video: HTMLVideoElement, private enabled: boolean) {}
+  // The player swaps in a fresh <video> to recover a wedged stream, so the
+  // element is looked up on every use.
+  constructor(private getVideo: () => HTMLVideoElement | null, private enabled: boolean) {}
+
+  private mediaId(): string | undefined {
+    return (this.getVideo() as VideoWithMediaId | null)?.mediaId;
+  }
 
   start(): void {
     if (this.subscription || !isWebOS() || !isLunaAvailable()) return;
@@ -79,6 +85,22 @@ export class PictureShapeFix {
       onSuccess: status => this.onStatus(status),
       onFailure: error => log.warn('Video output status unavailable', 'event=playback.picture_shape.unavailable',
         `reason=${String(error.errorText ?? error.errorCode ?? 'unknown')}`),
+    });
+    // The TV can report a new picture before the element exposes its new
+    // mediaId, and may not report it again, so ask once the element has it.
+    // Media events do not bubble, but capture still sees a replaced element's.
+    for (const type of ['loadedmetadata', 'playing', 'resize']) {
+      document.addEventListener(type, event => {
+        if (event.target === this.getVideo()) this.refresh();
+      }, true);
+    }
+  }
+
+  private refresh(): void {
+    if (!this.enabled || !this.mediaId()) return;
+    lunaRequest<VideoOutputStatus>(VIDEO_OUTPUT, {
+      method: 'getStatus',
+      onSuccess: status => this.onStatus(status),
     });
   }
 
@@ -93,7 +115,7 @@ export class PictureShapeFix {
   }
 
   private onStatus(status: VideoOutputStatus): void {
-    const mediaId = (this.video as VideoWithMediaId).mediaId;
+    const mediaId = this.mediaId();
     if (!mediaId || !status.video) return;
     const entry = status.video.find(item => item.context === mediaId);
     if (!entry) return;
@@ -106,7 +128,9 @@ export class PictureShapeFix {
   }
 
   private area(): Rect {
-    const r = this.video.getBoundingClientRect();
+    const video = this.getVideo();
+    if (!video) return { x: 0, y: 0, width: 0, height: 0 };
+    const r = video.getBoundingClientRect();
     return { x: r.left, y: r.top, width: r.width, height: r.height };
   }
 

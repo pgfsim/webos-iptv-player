@@ -232,7 +232,7 @@ class App {
     );
 
     this.player.init($('#video-player') as HTMLVideoElement);
-    this.pictureShape = new PictureShapeFix($('#video-player') as HTMLVideoElement, StorageService.getFixPictureShape());
+    this.pictureShape = new PictureShapeFix(() => this.player.getVideoElement(), StorageService.getFixPictureShape());
     this.pictureShape.start();
     this.livePreview = new LivePreview($('#live-preview')!, {
       channelView: this.views.channels,
