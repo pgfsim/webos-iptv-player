@@ -90,6 +90,128 @@ describe('DashSubtitles helpers', () => {
     vi.unstubAllGlobals();
   });
 
+  it("times segments on another pipeline's clock, waiting for its first position", async () => {
+    vi.useFakeTimers();
+    const manifest = `<?xml version="1.0"?><MPD
+      xmlns="urn:mpeg:dash:schema:mpd:2011" type="dynamic">
+      <Period><AdaptationSet contentType="text" mimeType="text/vtt" lang="l1">
+        <SegmentTemplate media="sub-$Time$.vtt" timescale="1">
+          <SegmentTimeline><S t="20" d="4"/></SegmentTimeline>
+        </SegmentTemplate>
+        <Representation id="s1"/>
+      </AdaptationSet></Period></MPD>`;
+    const fetchMock = vi.fn(async (url: string) => ({
+      ok: true,
+      status: 200,
+      url,
+      text: async () => url.endsWith('.mpd')
+        ? manifest
+        : 'WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nAlpha\n',
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+    vi.stubGlobal('VTTCue', class {
+      constructor(
+        public startTime: number,
+        public endTime: number,
+        public text: string,
+      ) {}
+    });
+    const tracks: Array<{ mode: string; cues: TextTrackCue[] }> = [];
+    // The placeholder element loops its own short clip.
+    const video = {
+      currentTime: 0.5,
+      seekable: { length: 1, start: () => 0, end: () => 2 },
+      addTextTrack: () => {
+        const cues: TextTrackCue[] = [];
+        const track = {
+          mode: 'disabled',
+          cues,
+          addCue: (cue: TextTrackCue) => cues.push(cue),
+          removeCue: (cue: TextTrackCue) => {
+            const index = cues.indexOf(cue);
+            if (index >= 0) cues.splice(index, 1);
+          },
+        };
+        tracks.push(track);
+        return track;
+      },
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+    } as unknown as HTMLVideoElement;
+    let now = NaN;
+    const service = new DashSubtitles();
+
+    await service.start(video, 'http://host/stream.mpd', { lang: 'l1' }, () => now);
+    expect(fetchMock.mock.calls.filter(([url]) => url.endsWith('.vtt'))).toEqual([]);
+
+    now = 21;
+    await (service as unknown as {
+      refresh(url: string, want: { lang: string }, gen: number): Promise<void>;
+    }).refresh('http://host/stream.mpd', { lang: 'l1' },
+      (service as unknown as { gen: number }).gen);
+
+    expect(fetchMock).toHaveBeenCalledWith('http://host/sub-20.vtt');
+    expect(tracks[0].cues).toEqual([expect.objectContaining({ startTime: 21, endTime: 22, text: 'Alpha' })]);
+    service.stop();
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
+
+  it('skips a rendition the menu dropped when it reuses a read MPD', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(Date.parse('2020-01-01T00:01:00Z'));
+    const manifest = `<?xml version="1.0"?><MPD
+      xmlns="urn:mpeg:dash:schema:mpd:2011" type="dynamic"
+      availabilityStartTime="2020-01-01T00:00:00Z">
+      <Period start="PT0S">
+        <AdaptationSet contentType="text" mimeType="text/vtt" lang="l1">
+          <SegmentTemplate media="dropped-$Time$.vtt" timescale="1">
+            <SegmentTimeline><S t="0" d="4" r="20"/></SegmentTimeline>
+          </SegmentTemplate>
+          <Representation id="s1"/>
+        </AdaptationSet>
+        <AdaptationSet contentType="text" mimeType="text/vtt" lang="l1">
+          <SegmentTemplate media="kept-$Number$.vtt" timescale="1" duration="4"/>
+          <Representation id="s2"/>
+        </AdaptationSet>
+      </Period></MPD>`;
+    const fetchMock = vi.fn(async (url: string) => ({
+      ok: true,
+      status: 200,
+      url,
+      text: async () => 'WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nAlpha\n',
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+    vi.stubGlobal('VTTCue', class {
+      constructor(
+        public startTime: number,
+        public endTime: number,
+        public text: string,
+      ) {}
+    });
+    const video = {
+      currentTime: 0,
+      addTextTrack: () => ({
+        mode: 'disabled',
+        cues: [],
+        addCue: () => {},
+        removeCue: () => {},
+      }),
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+    } as unknown as HTMLVideoElement;
+    const service = new DashSubtitles();
+
+    await service.start(video, 'http://host/stream.mpd', { lang: 'l1' }, () => 60, manifest);
+
+    const urls = fetchMock.mock.calls.map(([url]) => url);
+    expect(urls.length).toBeGreaterThan(0);
+    expect(urls.every(url => url.includes('/kept-'))).toBe(true);
+    service.stop();
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
+
   it('requests SegmentList mediaRange entries with a Range header', async () => {
     vi.useFakeTimers();
     const manifest = `<?xml version="1.0"?><MPD

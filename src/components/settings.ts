@@ -756,6 +756,7 @@ export class Settings {
     const textSize = StorageService.getTextSize();
     const localePreference = StorageService.getLocalePreference();
     const liveReconnectAttempts = StorageService.getLiveReconnectAttempts();
+    const headerPlayback = StorageService.getHeaderPlayback();
     const numberEntryOsdTimeoutMs = StorageService.getNumberEntryOsdTimeoutMs();
     const playerOsdTimeoutMs = StorageService.getPlayerOsdTimeoutMs();
     const animationMode = StorageService.getAnimationMode();
@@ -1094,6 +1095,20 @@ export class Settings {
                       })),
                       String(liveReconnectAttempts),
                     )}
+                    </div>
+                  </div>
+                  <div class="settings-advanced-row">
+                    <div class="settings-advanced-group" aria-hidden="true"></div>
+                    <div class="settings-advanced-description">
+                      <div class="settings-item-title">${t('settings.httpHeaders')}</div>
+                      <div class="settings-item-hint">${t('settings.httpHeadersHint')}</div>
+                    </div>
+                    <div class="settings-advanced-control">
+                    ${toggleGroup('header-playback', [
+                      { value: 'off', label: t('common.off') },
+                      { value: 'luna', label: t('settings.httpHeadersMediaService') },
+                      { value: 'proxy', label: t('settings.httpHeadersLocalProxy') },
+                    ], headerPlayback)}
                     </div>
                   </div>
                   <div class="settings-advanced-row">
@@ -1781,11 +1796,11 @@ export class Settings {
   private renderCacheUsage(usage: CacheUsageSummary): void {
     const target = $('#cache-usage', this.container);
     if (!target) return;
-    const usedPercent = usage.budgetBytes > 0
+    const usedPercent = usage.budgetBytes
       ? Math.max(0, Math.min(100, usage.total.bytes / usage.budgetBytes * 100))
       : 0;
     const used = formatBytes(usage.total.bytes);
-    const budget = formatBytes(usage.budgetBytes);
+    const budget = usage.budgetBytes === null ? '—' : formatBytes(usage.budgetBytes);
     morph(target, html`
       <div class="cache-usage-total" role="img" aria-label="${used} / ${budget}">
         <svg class="cache-usage-ring" viewBox="0 0 120 120" aria-hidden="true">
@@ -2938,6 +2953,11 @@ export class Settings {
       ($('#live-reconnect-attempts', this.container) as HTMLElement | null)?.dataset.value,
     );
     StorageService.setLiveReconnectAttempts(liveReconnectAttempts);
+
+    const headerPlayback = $('#header-playback .toggle-option.active', this.container)?.dataset.value;
+    if (headerPlayback === 'off' || headerPlayback === 'luna' || headerPlayback === 'proxy') {
+      StorageService.setHeaderPlayback(headerPlayback);
+    }
 
     const numberEntryOsdTimeoutMs = Number(
       ($('#number-entry-osd-timeout', this.container) as HTMLElement | null)?.dataset.value,

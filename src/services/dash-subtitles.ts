@@ -16,6 +16,10 @@ export class DashSubtitles {
   private seen = new Set<string>();
   private gen = 0;
   private _active = false;
+  private clock: (() => number) | null = null;
+  private manifestText: string | undefined;
+  private onUnavailable: ((reason: string) => void) | null = null;
+  private loadedSegment = false;
 
   get active(): boolean {
     return this._active;
@@ -25,16 +29,26 @@ export class DashSubtitles {
     video: HTMLVideoElement,
     manifestUrl: string,
     want?: { name?: string; lang?: string },
+    // Another pipeline's playback clock, when the element plays a placeholder.
+    clock?: () => number,
+    // The MPD already read, at manifestUrl, when the page cannot read it again.
+    manifestText?: string,
+    // Called once, after stopping, when the rendition can never render.
+    onUnavailable?: (reason: string) => void,
   ): Promise<void> {
     this.stop();
     const gen = ++this.gen;
     this.video = video;
+    this.clock = clock ?? null;
+    this.manifestText = manifestText;
+    this.onUnavailable = onUnavailable ?? null;
+    this.loadedSegment = false;
     try {
       const subtitle = await this.loadSubtitle(manifestUrl, want, gen);
       if (gen !== this.gen || !subtitle) return;
       this._active = true;
-      this.cueTrack.attach(video, t('player.subtitles'), subtitle.lang || 'und');
-      log.info('subtitles on:', subtitle.name || subtitle.lang || '?');
+      this.cueTrack.attach(video, t('player.subtitles'), subtitle.lang || 'und', this.clock ?? undefined);
+      log.info('subtitles on:', 'format=webvtt', 'source=dash');
       await this.refresh(manifestUrl, want, gen);
       if (gen === this.gen) {
         this.timer = setInterval(
@@ -59,6 +73,10 @@ export class DashSubtitles {
     this.seen.clear();
   }
 
+  private now(): number {
+    return this.clock ? this.clock() : (this.video?.currentTime ?? 0);
+  }
+
   setOffset(seconds: number): void {
     this.cueTrack.setOffset(seconds);
   }
@@ -72,11 +90,22 @@ export class DashSubtitles {
     want: { name?: string; lang?: string } | undefined,
     gen: number,
   ): Promise<ManifestSubtitle | null> {
-    const res = await fetch(manifestUrl);
-    if (!res.ok) throw new Error(`HTTP ${String(res.status)}`);
-    const parsed = parseMpd(await res.text(), res.url, this.video?.currentTime);
+    let text = this.manifestText;
+    let base = manifestUrl;
+    if (text === undefined) {
+      const res = await fetch(manifestUrl);
+      if (!res.ok) throw new Error(`HTTP ${String(res.status)}`);
+      text = await res.text();
+      base = res.url;
+    }
+    const now = this.now();
+    const parsed = parseMpd(text, base, Number.isFinite(now) ? now : undefined);
     if (gen !== this.gen) return null;
-    return pickWebVttSubtitle(parsed.subtitles, want);
+    // A rendition only a manifest re-read can extend is not in the menu.
+    const subtitles = this.manifestText === undefined
+      ? parsed.subtitles
+      : parsed.subtitles.filter(s => !s.dash?.needsManifestRefresh);
+    return pickWebVttSubtitle(subtitles, want);
   }
 
   private async refresh(
@@ -93,8 +122,10 @@ export class DashSubtitles {
       const segments = source.segments?.length
         ? source.segments
         : source.url ? [{ url: source.url, start: 0, duration: 0 }] : [];
-      const currentTime = this.video.currentTime;
-      const seekable = this.video.seekable;
+      const currentTime = this.now();
+      // No cue can be placed before the clock reports a position.
+      if (!Number.isFinite(currentTime)) return;
+      const seekable = this.clock ? null : this.video.seekable;
       const ahead = seekable?.length
         ? seekable.end(seekable.length - 1) + 5
         : currentTime + 15;
@@ -112,10 +143,22 @@ export class DashSubtitles {
               headers: { Range: `bytes=${segment.range}` },
             })
           : await fetch(segment.url);
-        if (!response.ok) throw new Error(`HTTP ${String(response.status)}`);
+        if (!response.ok) {
+          if (gen !== this.gen) return;
+          // Segments of an MPD only the service could read go out without its
+          // headers; a header refusal before any segment loaded never clears.
+          // Any other 4xx, such as a live edge ahead of the origin, retries.
+          if (this.manifestText !== undefined && !this.loadedSegment
+            && (response.status === 401 || response.status === 403)) {
+            this.unavailable(`segment_http_${String(response.status)}`);
+            return;
+          }
+          throw new Error(`HTTP ${String(response.status)}`);
+        }
         const parsed = parseWebVTT(await response.text());
         if (gen !== this.gen || !this.cueTrack.current) return;
         this.seen.add(key);
+        this.loadedSegment = true;
         for (const cue of parsed.cues) {
           const start = cueMediaTime(segment, cue.start, parsed.mapLocal);
           const end = start + cue.end - cue.start;
@@ -125,10 +168,16 @@ export class DashSubtitles {
       for (const key of Array.from(this.seen)) {
         if (!currentKeys.has(key)) this.seen.delete(key);
       }
-      this.cueTrack.prune(this.video.currentTime - CUE_RETENTION_S);
+      this.cueTrack.prune(this.now() - CUE_RETENTION_S);
     } catch (e) {
       log.debug('subtitles refresh failed:', e);
     }
+  }
+
+  private unavailable(reason: string): void {
+    const report = this.onUnavailable;
+    this.stop();
+    report?.(reason);
   }
 
 }

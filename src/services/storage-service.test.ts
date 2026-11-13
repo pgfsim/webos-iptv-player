@@ -255,6 +255,27 @@ describe('StorageService', () => {
     StorageService.setPlaylistsReplacedHandler(() => {});
   });
 
+  it('plays header channels through the media service unless set otherwise', () => {
+    expect(StorageService.getHeaderPlayback()).toBe('luna');
+    StorageService.setHeaderPlayback('off');
+    expect(localStorage.getItem('iptv_header_playback')).toBe('"off"');
+    expect(StorageService.getHeaderPlayback()).toBe('off');
+    StorageService.setHeaderPlayback('proxy');
+    expect(localStorage.getItem('iptv_header_playback')).toBe('"proxy"');
+    expect(StorageService.getHeaderPlayback()).toBe('proxy');
+    localStorage.setItem('iptv_header_playback', '"other"');
+    expect(StorageService.getHeaderPlayback()).toBe('luna');
+  });
+
+  it('clears the window lookup latch when the header playback setting changes', () => {
+    StorageService.setHeaderPlayback('proxy');
+    StorageService.setLunaWindowUnsupported('ua1');
+    StorageService.setHeaderPlayback('proxy');
+    expect(StorageService.getLunaWindowUnsupported()).toBe('ua1');
+    StorageService.setHeaderPlayback('luna');
+    expect(StorageService.getLunaWindowUnsupported()).toBeNull();
+  });
+
   it('persists live preview on and off independently from autoplay and sources', () => {
     StorageService.setAutoPlay(true);
     StorageService.setPlaylists([{ id: 'p1', name: 'P1', url: 'http://host/a' }]);
@@ -1361,14 +1382,41 @@ describe('StorageService channel customization store', () => {
     expect(StorageService.getChannelCustomization()).toBeNull();
   });
 
-  it('round-trips the last channel keys and the show-hidden toggle', () => {
-    expect(StorageService.getLastChannelKey()).toBe('');
-    StorageService.setLastChannelKey('k1');
-    expect(StorageService.getLastChannelKey()).toBe('k1');
+  it('round-trips the last channel record and the show-hidden toggle', () => {
+    expect(StorageService.getLastChannel()).toBeNull();
+    StorageService.setLastChannel({ index: 2, key: 'k1', stream: 's1', exact: 'e1' });
+    expect(JSON.parse(localStorage.getItem('iptv_last_channel')!))
+      .toEqual({ index: 2, key: 'k1', stream: 's1', exact: 'e1' });
+    expect(StorageService.getLastChannel())
+      .toEqual({ index: 2, key: 'k1', stream: 's1', exact: 'e1' });
 
     expect(StorageService.getShowHiddenChannels()).toBe(false);
     StorageService.setShowHiddenChannels(true);
     expect(StorageService.getShowHiddenChannels()).toBe(true);
+  });
+  it('migrates a legacy last channel index and key into one record', () => {
+    localStorage.setItem('iptv_last_channel', '3');
+    localStorage.setItem('iptv_last_channel_key', JSON.stringify('k1'));
+
+    expect(StorageService.getLastChannel()).toEqual({ index: 3, key: 'k1' });
+    expect(JSON.parse(localStorage.getItem('iptv_last_channel')!)).toEqual({ index: 3, key: 'k1' });
+    expect(localStorage.getItem('iptv_last_channel_key')).toBeNull();
+  });
+
+  it('drops the legacy key on write', () => {
+    localStorage.setItem('iptv_last_channel_key', JSON.stringify('k1'));
+    StorageService.setLastChannel({ index: 1, key: 'k2' });
+    expect(localStorage.getItem('iptv_last_channel_key')).toBeNull();
+    expect(StorageService.getLastChannel()).toEqual({ index: 1, key: 'k2' });
+  });
+
+  it('treats a malformed last channel record as absent', () => {
+    localStorage.setItem('iptv_last_channel', '{"index":');
+    expect(StorageService.getLastChannel()).toBeNull();
+    localStorage.setItem('iptv_last_channel', JSON.stringify({ key: 'k1' }));
+    expect(StorageService.getLastChannel()).toBeNull();
+    localStorage.setItem('iptv_last_channel', JSON.stringify('k1'));
+    expect(StorageService.getLastChannel()).toBeNull();
   });
 });
 

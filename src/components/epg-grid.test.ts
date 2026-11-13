@@ -173,6 +173,21 @@ describe('entry channel focus', () => {
     expect(container.querySelector('.epg-channel-item.focused')
       ?.getAttribute('data-channel-idx')).toBe('0');
   });
+
+  it('keeps copies that differ only by a token apart', () => {
+    state.channels = [
+      { name: 'Chan A', group: 'News', url: 'http://host/a?token=t1', playlistIds: ['p1'] },
+      { name: 'Chan A', group: 'News', url: 'http://host/a?token=t2', playlistIds: ['p1'] },
+    ];
+    grid.focusChannel(1);
+    grid.render();
+    Focus.flush();
+
+    const keys = channelItems().map(item => item.getAttribute('data-key'));
+    expect(new Set(keys).size).toBe(2);
+    expect(container.querySelector('.epg-channel-item.focused')
+      ?.getAttribute('data-channel-idx')).toBe('1');
+  });
 });
 const progItems = () => Array.from(container.querySelectorAll('.epg-programme-item'));
 
@@ -218,6 +233,14 @@ describe('EpgGrid.render', () => {
     const now = container.querySelector('.epg-programme-item.current');
     expect(now!.querySelector('.live-badge')).not.toBeNull();
     expect(now!.querySelector('.epg-prog-title')!.textContent).toContain('Noon Show');
+  });
+
+  it('leaves long descriptions whole for the CSS line clamp', () => {
+    const description = 'word '.repeat(60).trim();
+    state.programmes['Chan A'][0] = { ...state.programmes['Chan A'][0], description };
+    grid.render();
+
+    expect(progItems()[0].querySelector('.epg-prog-desc')!.textContent).toBe(description);
   });
 
   it('rebuilds row sizes when refreshed programme data changes descriptions', () => {

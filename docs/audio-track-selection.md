@@ -114,10 +114,19 @@ match** (so a collapsed list isn't mislabelled):
 ## Per-track-source memory
 
 The chosen track is remembered as `{ name, language }` and re-applied on the next tune-in — matched
-by name, then language, else the stream default. Live/catch-up channels key on `channelKey`; VOD
+by name, then language, else the stream default. A saved language matches across ISO 639 forms
+(a three-letter code, bibliographic or terminology, matches its two-letter form) on both the `<video>` and Luna paths; a regional code still needs an exact
+match. Live/catch-up channels key on `channelKey`; VOD
 (Xtream movies/episodes) keys on `vod:<account>:<kind>:<itemId>`, so a movie and an episode each keep
 their own pick. The manifest names are what make this reliable for HLS; the empty-metadata native
 tracks alone can't be keyed, but a VOD container's tracks usually carry real labels.
+
+## Header channels on Luna playback
+
+A header channel playing through `com.webos.media/load` has only a silent placeholder in its
+`<video>`, so the app switches with `selectTrack {mediaId, type:"audio", index}` on its own Luna
+`mediaId` (never `type:"text"`, which kills the pipeline). The menu, naming, and saved-pick rules
+are in [HTTP header playback](http-header-playback.md#audio-tracks).
 
 ## Desktop preview (hls.js)
 

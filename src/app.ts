@@ -980,10 +980,7 @@ class App {
 
       if (StorageService.getAutoPlay()) {
         // The per-stream key survives customization and provider reshuffles.
-        const lastCh = PlaylistService.resolveLastChannelIndex(
-          StorageService.getLastChannelKey(),
-          StorageService.getLastChannel(),
-        );
+        const lastCh = PlaylistService.resolveLastChannelIndex(StorageService.getLastChannel());
         const last = PlaylistService.channels[lastCh];
         // A locked channel must not open a PIN prompt over a cold start.
         if (last && ParentalControlService.decision(liveParentalRequest(last)).allowed) {
@@ -1803,7 +1800,9 @@ class App {
   }
 
   private initSidebarTrigger(): void {
-    document.addEventListener('pointermove', (e: PointerEvent) => {
+    document.addEventListener('nav:pointermove', (event: Event) => {
+      const e = (event as CustomEvent<{ clientX: number; clientY: number }>).detail;
+      const target = event.target instanceof Element ? event.target : null;
       const currentView = this.viewStack[this.viewStack.length - 1];
       if (currentView !== 'player') return;
 
@@ -1822,12 +1821,12 @@ class App {
 
       // Protect the full-width area beside and below the OSD too: its edge
       // controls sit next to margins where an imprecise cursor can open a panel.
-      const overTabs = !!(e.target as HTMLElement).closest('.player-sidebar .sidebar-tabs');
+      const overTabs = !!target?.closest('.player-sidebar .sidebar-tabs');
       if (!overOsd && !vod && !modal && e.clientX < 80 && !this.menu.visible) {
         this.sidebar.show();
         this.sidebar.handlePointerMove(e.clientX, false, overTabs);
       } else if (this.sidebar.visible) {
-        const overSidebar = !!(e.target as HTMLElement).closest('.player-sidebar');
+        const overSidebar = !!target?.closest('.player-sidebar');
         const delayingDismiss = this.sidebar.handlePointerMove(e.clientX, overSidebar, overTabs);
         if (!delayingDismiss && !overSidebar
             && e.clientX > this.sidebar.pointerDismissX && !this.sidebar.keyboardOn) {
@@ -1843,7 +1842,7 @@ class App {
       if (!overOsd && !modal && e.clientX > 1840 && !this.sidebar.visible) {
         this.menu.show();
       } else if (this.menu.visible) {
-        const overMenu = !!(e.target as HTMLElement).closest('.player-menu');
+        const overMenu = !!target?.closest('.player-menu');
         if (overMenu) {
           this.menu.resetTimer();
         } else if (e.clientX < 1540) {

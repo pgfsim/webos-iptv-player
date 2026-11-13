@@ -4,8 +4,11 @@ Scoped to `bundled-service/`; the root `AGENTS.md` still applies.
 
 A sandbox-separate Node (CommonJS) webOS service,
 `com.lennylxx.iptv.service`. It hosts LAN phone setup and M3U uploads and,
-in Developer Mode, interactive program-reminder alerts. `src/index.ts` wires
-`lan/`, `setup/`, and `reminder/`.
+in Developer Mode, interactive program-reminder alerts. It also reads
+manifests with channel headers for the app's Luna playback, and
+proxies header streams on loopback for the app's Local proxy mode.
+`src/index.ts` wires `lan/`, `setup/`, `reminder/`, `fetch/`, and
+`proxy/`.
 
 **Read `docs/lan-service.md` before changing it.**
 
@@ -17,16 +20,27 @@ It must run on webOS 4's Node.js 0.12.2:
 - route newer Node APIs through `compat.ts`;
 - the final JavaScript build is gated, like the app bundle.
 
+Log through `createLogger(tag)` (`src/logger.ts`), never bare `console`:
+only its lines, plus every warning and error, reach the service log file
+that `tv.sh logs --service` and `tv.sh diag` read.
+
 ## Contract with the app
 
 - **Luna:** `start` / `stop` / `heartbeat` / `serviceEvents` for LAN
-  changes; `getDevMode` / `fireReminderAlert` for reminders.
-- **HTTP:** phone setup pages and uploads.
+  changes; `getDevMode` / `fireReminderAlert` for reminders;
+  `fetchManifest` (app-only) for Luna header playback; `openProxy` /
+  `touchProxy` / `closeProxy` (app-only) for Local proxy header playback.
+- **HTTP:** phone setup pages and uploads; a separate loopback-only
+  proxy server for Local proxy sessions, plus its `POST /open`,
+  `/touch`, and `/close` control routes when run standalone off the TV
+  (`docs/lan-service.md`).
 - Changes are pushed through `serviceEvents`; nothing polls.
 - The lifecycle follows the app's `visibilitychange`.
 
-Keep both sides aligned with `src/services/setup-client.ts` and
-`src/services/upload-client.ts` in the app, and update their colocated tests
+Keep both sides aligned with `src/services/setup-client.ts`,
+`src/services/upload-client.ts`, `src/services/manifest-service.ts`, and
+`src/services/proxy-service.ts` in
+the app, and update their colocated tests
 with any messaging change.
 
 ## Reminder alerts

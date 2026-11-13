@@ -189,7 +189,7 @@ test.describe('Settings navigation', () => {
         };
       }));
 
-    expect(layouts).toHaveLength(6);
+    expect(layouts).toHaveLength(7);
     for (const layout of layouts) {
       expect(Math.abs(layout.controlCenter - layout.rowCenter)).toBeLessThanOrEqual(1);
       expect(layout.controlRightGap).toBe(20);
@@ -407,6 +407,41 @@ test.describe('Settings navigation', () => {
       expect(layout.groupOverlaps, locale).toEqual([]);
       expect(layout.groupRight, locale).toBeLessThanOrEqual(layout.sectionRight);
       expect(layout.hintRight, locale).toBeLessThanOrEqual(layout.sectionRight);
+    }
+  });
+
+  test('keeps the HTTP headers options one line and as tall as other toggles beside a long hint', async ({ page }) => {
+    const locales = ['en', 'de', 'es', 'fr', 'it', 'pl', 'pt-BR', 'ru', 'tr', 'uk', 'zh-CN'];
+    await page.goto('/');
+
+    for (const locale of locales) {
+      await page.evaluate((value) => {
+        localStorage.setItem('iptv_locale', JSON.stringify(value));
+        localStorage.setItem('iptv_text_size', JSON.stringify('150'));
+      }, locale);
+      await page.reload();
+      await page.locator('[data-settings-target="advanced"]').click();
+
+      const layout = await page.locator('#header-playback').evaluate((group) => {
+        const buttons = Array.from(group.querySelectorAll<HTMLElement>('.toggle-option'));
+        const section = group.closest<HTMLElement>('.settings-section')!;
+        return {
+          wrapped: buttons.filter((button) => {
+            const range = document.createRange();
+            range.selectNodeContents(button);
+            return range.getClientRects().length !== 1;
+          }).map(button => button.textContent?.trim() ?? ''),
+          heights: buttons.map(button => Math.round(button.getBoundingClientRect().height)),
+          reference: Math.round(document.querySelector<HTMLElement>('#animation-mode .toggle-option')!
+            .getBoundingClientRect().height),
+          groupRight: Math.round(group.getBoundingClientRect().right),
+          sectionRight: Math.round(section.getBoundingClientRect().right),
+        };
+      });
+
+      expect(layout.wrapped, locale).toEqual([]);
+      expect(layout.heights, locale).toEqual([layout.reference, layout.reference, layout.reference]);
+      expect(layout.groupRight, locale).toBeLessThanOrEqual(layout.sectionRight);
     }
   });
 
@@ -696,6 +731,27 @@ test.describe('Settings navigation', () => {
     });
 
     expect(rowCounts).toEqual([5, 5, 5]);
+  });
+
+  test('selects and saves Local proxy for HTTP headers', async ({ page }) => {
+    await routePlaylist(page);
+    await seedPlaylist(page);
+    await page.goto('/');
+    await enterTab(page, 'settings');
+    await page.locator('[data-settings-target="advanced"]').click();
+
+    const proxy = page.locator('#header-playback .toggle-option[data-value="proxy"]');
+    await expect(proxy).toBeEnabled();
+    await proxy.click();
+    await expect(proxy).toHaveClass(/active/);
+    await page.locator('#save-settings').click();
+    await expect(page.locator('#view-channels')).toBeVisible();
+    expect(await page.evaluate(() => localStorage.getItem('iptv_header_playback'))).toBe('"proxy"');
+
+    await page.reload();
+    await enterTab(page, 'settings');
+    await page.locator('[data-settings-target="advanced"]').click();
+    await expect(proxy).toHaveClass(/active/);
   });
 
   test('the text size picker scales only fonts and persists', async ({ page }) => {

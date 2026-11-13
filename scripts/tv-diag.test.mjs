@@ -1,7 +1,4 @@
-// @vitest-environment jsdom
-// jsdom, because the active probe is stringified and evaluated inside the
-// TV's webview; every other case here is a pure function.
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { describe, expect, it } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
@@ -18,13 +15,13 @@ import {
   parseNativeMetricOutput,
   parseDiagnosticArgs,
   activeProbeExpression,
-  snapshotProbeExpression,
   formatDiagnosticSummary,
   runNativeProbe,
-  runNativePlaylistProbe,
+  readServiceLog,
   inspectorWebSocketUrl,
   startAresInspector,
   startNativeMetricWindow,
+  evaluateOnLegacyEngine,
 } from './tv-diag.mjs';
 
 describe('tv-diag arguments', () => {
@@ -330,6 +327,15 @@ describe('DiagnosticRedactor', () => {
     expect(text).not.toContain('pass1');
   });
 
+  it('redacts a short secret only as a whole token, leaving words that contain it', () => {
+    const redactor = new DiagnosticRedactor({ secrets: ['pl', 'u1'] });
+    const text = redactor.text('completed plain playlist user=pl pass=u1 /pl/u1/ menu1');
+    expect(text).toContain('completed plain playlist');
+    expect(text).toContain('menu1');
+    expect(text).toContain('user=~redacted-2-alnum~ pass=~redacted-2-alnum~');
+    expect(text).toContain('/~redacted-2-alnum~/~redacted-2-alnum~/');
+  });
+
   it('leaves values untouched in full mode', () => {
     const redactor = new DiagnosticRedactor({ full: true, secrets: ['pass1'] });
     expect(redactor.url('http://host/a?password=pass1')).toBe('http://host/a?password=pass1');
@@ -391,6 +397,44 @@ exit 23
     } finally {
       rmSync(bin, { recursive: true, force: true });
     }
+  });
+
+  it('reads the rotated and current service log from the TV temp root', () => {
+    let command = '';
+    const result = readServiceLog({
+      execFile: (_file, args) => {
+        command = args[1];
+        return "\rEnter passphrase for key '/home/user/.ssh/key': \r\n"
+          + 'line 1\r\n\nline 2\n';
+      },
+    });
+
+    expect(command).toContain('temp_root=/media/developer/temp');
+    expect(command).toContain('temp_root=/tmp');
+    expect(command).toContain('if [ -e "$log" ] || [ -e "$log.1" ]; then cat "$log.1" "$log"');
+    expect(command).toContain('log="$temp_root/com.lennylxx.iptv.service.log"');
+    expect(result).toEqual({ lines: ['line 1', 'line 2'], error: '' });
+    expect(readServiceLog({
+      execFile: () => { throw Object.assign(new Error('x'), { stderr: 'tv.sh: connection timed out\n' }); },
+    })).toEqual({ lines: [], error: 'tv.sh: connection timed out' });
+    expect(formatDiagnosticSummary({
+      capturedAt: '', app: {}, environment: {}, state: {}, playlists: [],
+      serviceLog: { lines: [], error: 'tv.sh: connection timed out' },
+    })).toContain('Service log: unavailable (tv.sh: connection timed out)');
+    expect(formatDiagnosticSummary({
+      capturedAt: '', app: {}, environment: {}, state: {}, playlists: [],
+      serviceLog: {
+        lines: [
+          '2026-01-01T00:00:00.000Z log [lan] peer sent warn and error words',
+          '2026-01-01T00:00:01.000Z error [service] failed',
+        ],
+        error: '',
+      },
+    })).toContain('2 lines, 2026-01-01T00:00:00.000Z to 2026-01-01T00:00:01.000Z | warnings=0 errors=1');
+    expect(readServiceLog({ execFile: () => '__IPTV_NO_SERVICE_LOG__\r\n' })).toEqual({
+      lines: [],
+      error: 'no service log on the TV; has the service started?',
+    });
   });
 
   it('normalizes network events without request headers', () => {
@@ -574,10 +618,18 @@ exit 23
         text: '[Playlist] Playlist load completed event=playlist.load.completed'
           + ' source=network channels=0 all=0 groups=0 epg=1 sources=1 failed=1',
       }],
+      serviceLog: {
+        lines: [
+          '2026-01-01T00:00:00.000Z log [fetch] fetchManifest outcome=ok status=200',
+          '2026-01-01T00:00:01.000Z warn [lan] fetch http://host/get.php?username=user1 failed',
+        ],
+        error: '',
+      },
       networkEvents: [],
     });
     const serialized = JSON.stringify(report);
-    expect(report.schemaVersion).toBe(4);
+    expect(report.schemaVersion).toBe(5);
+    expect(report.serviceLog.lines[0]).toContain('fetchManifest outcome=ok');
     expect(serialized).not.toContain('user1');
     expect(serialized).not.toContain('pass1');
     expect(serialized).not.toContain('Alpha.m3u8');
@@ -589,6 +641,9 @@ exit 23
       'Media source: type=video/x-matroska canPlayType="" — source skipped without an error event',
     );
     expect(summary).toContain('Codec support: 1/2 playable | rejected: video/x-matroska');
+    expect(summary).toContain(
+      'Service log: 2 lines, 2026-01-01T00:00:00.000Z to 2026-01-01T00:00:01.000Z | warnings=1 errors=0',
+    );
   });
 
   it('reports catalog counts as unknown when the app exposes no snapshot', () => {
@@ -689,8 +744,13 @@ describe('diagnostic capture recovery', () => {
         child: { killed: false, kill() { this.killed = true; } },
       }),
       now: () => new Date('2026-09-10T05:00:01.000Z'),
+      execFile: () => '2026-09-10T05:00:00.500Z error [service] failed\n',
     });
 
+    expect(report.serviceLog).toEqual({
+      lines: ['2026-09-10T05:00:00.500Z error [service] failed'],
+      error: '',
+    });
     expect(report.capture).toEqual({
       complete: false,
       phase: 'capturing-final-state',
@@ -706,205 +766,37 @@ describe('diagnostic capture recovery', () => {
   });
 });
 
-describe('active diagnostics probe', () => {
-  // The probe is stringified and evaluated inside the TV's webview, so run it
-  // the same way here: a real DOM, no bundler, no module scope.
-  const runProbe = () => (0, eval)(activeProbeExpression);
-  const runSnapshot = () => (0, eval)(snapshotProbeExpression);
+describe('legacy engine probes', () => {
+  it('lowers a probe for Chromium 53 and polls its parked result', async () => {
+    const sent = [];
+    let polls = 0;
+    const client = {
+      async call(method, params) {
+        sent.push(params.expression);
+        if (sent.length === 1) return { result: { type: 'undefined' } };
+        polls++;
+        return { result: { value: polls < 2 ? { done: false } : { done: true, value: { view: 'Alpha' } } } };
+      },
+    };
+    const waits = [];
 
-  beforeEach(() => {
-    localStorage.clear();
-    document.body.innerHTML = '';
-    window.fetch = () => Promise.reject(new Error('offline'));
+    await expect(evaluateOnLegacyEngine(client, activeProbeExpression, async (ms) => { waits.push(ms); }))
+      .resolves.toEqual({ view: 'Alpha' });
+    expect(sent[0]).not.toMatch(/\basync\b|\bawait\b|catch \{|\?\.|\?\?/);
+    expect(() => new Function(sent[0])).not.toThrow();
+    expect(waits).toEqual([100]);
   });
 
-  afterEach(() => {
-    vi.useRealTimers();
-  });
-
-  const appInfoResponse = {
-    json: async () => ({ id: 'app.id', version: '1.0.0' }),
-  };
-
-  it('takes a local snapshot without fetching playlist endpoints', async () => {
-    localStorage.setItem('iptv_playlists', JSON.stringify([{
-      source: 'm3u',
-      name: 'Alpha',
-      url: 'http://host/playlist.m3u',
-    }]));
-    let fetches = 0;
-    window.fetch = () => {
-      fetches++;
-      return Promise.reject(new Error('unexpected fetch'));
+  it('surfaces a probe that rejected on the page', async () => {
+    let calls = 0;
+    const client = {
+      async call() {
+        calls++;
+        return calls === 1 ? {} : { result: { value: { done: true, error: 'Error: Bravo' } } };
+      },
     };
 
-    const probe = await runSnapshot();
-
-    expect(fetches).toBe(0);
-    expect(probe.playlists).toEqual([
-      expect.objectContaining({
-        source: 'm3u',
-        name: 'Alpha',
-        __url: 'http://host/playlist.m3u',
-        webview: null,
-      }),
-    ]);
-  });
-
-  it('reports only rendered rows, leaving the catalog size to the load event', async () => {
-    document.body.innerHTML = '<div class="channel-item"></div><div class="channel-item"></div>';
-
-    const probe = await runProbe();
-
-    expect(probe.state.channelsRendered).toBe(2);
-    expect(probe.state).not.toHaveProperty('channels');
-  });
-
-  it('bounds playlist previews with an exact range and cancels ignored ranges', async () => {
-    localStorage.setItem('iptv_playlists', JSON.stringify([{
-      source: 'm3u',
-      name: 'Alpha',
-      url: 'http://host/playlist.m3u',
-    }]));
-    const cancel = vi.fn(async () => {});
-    const fetches = [];
-    window.fetch = async (url, init) => {
-      fetches.push({ url: String(url), init });
-      if (String(url) === 'appinfo.json') return appInfoResponse;
-      return {
-        status: 200,
-        headers: {
-          get: (name) => ({
-            'content-type': 'audio/x-mpegurl',
-            'content-length': '9000',
-          })[name] || null,
-        },
-        body: {
-          getReader: () => ({
-            read: async () => ({
-              done: false,
-              value: new TextEncoder().encode(`#EXTM3U\n${'a'.repeat(4096)}`),
-            }),
-            cancel,
-          }),
-        },
-      };
-    };
-
-    const probe = await runProbe();
-
-    expect(fetches).toHaveLength(2);
-    expect(fetches[1].init.headers).toEqual({ Range: 'bytes=0-2047' });
-    expect(fetches[1].init.signal).toBeInstanceOf(AbortSignal);
-    expect(cancel).toHaveBeenCalledOnce();
-    expect(probe.playlists[0].webview).toMatchObject({
-      status: 200,
-      contentType: 'audio/x-mpegurl',
-      contentLength: '9000',
-    });
-    expect(probe.playlists[0].webview.bodyPreview).toHaveLength(2048);
-  });
-
-  it('aborts a timed-out playlist probe without retrying', async () => {
-    vi.useFakeTimers();
-    localStorage.setItem('iptv_playlists', JSON.stringify([{
-      source: 'm3u',
-      name: 'Alpha',
-      url: 'http://host/playlist.m3u',
-    }]));
-    let playlistFetches = 0;
-    window.fetch = (url, init) => {
-      if (String(url) === 'appinfo.json') return Promise.resolve(appInfoResponse);
-      playlistFetches++;
-      return new Promise((_resolve, reject) => {
-        init.signal.addEventListener('abort', () => reject(new Error('probe timed out')));
-      });
-    };
-
-    const pending = runProbe();
-    await vi.advanceTimersByTimeAsync(5000);
-    const probe = await pending;
-
-    expect(playlistFetches).toBe(1);
-    expect(probe.playlists[0].webview).toMatchObject({
-      status: null,
-      bodyPreview: '',
-      error: 'Error: probe timed out',
-    });
-  });
-
-  it('skips webview and native playlist probes for one-connection accounts', async () => {
-    localStorage.setItem('iptv_playlists', JSON.stringify([{
-      source: 'xtream',
-      name: 'Alpha',
-      url: 'http://host',
-      xtream: { username: 'user1', password: 'pass1', liveOutput: 'auto' },
-    }]));
-    const urls = [];
-    window.fetch = async (url) => {
-      urls.push(String(url));
-      if (String(url) === 'appinfo.json') return appInfoResponse;
-      return {
-        status: 200,
-        json: async () => ({
-          user_info: {
-            auth: 1,
-            max_connections: '1',
-            allowed_output_formats: ['m3u8'],
-          },
-        }),
-      };
-    };
-
-    const probe = await runProbe();
-    const execFile = vi.fn();
-    const native = runNativePlaylistProbe(probe.playlists[0], { execFile });
-
-    expect(urls).toHaveLength(2);
-    expect(urls[1]).toContain('/player_api.php?');
-    expect(urls.join(' ')).not.toContain('/get.php?');
-    expect(probe.playlists[0].webview).toEqual({
-      status: null,
-      contentType: '',
-      contentLength: '',
-      bodyPreview: '',
-      error: '',
-      skipped: true,
-      skipReason: 'xtream-max-connections-at-most-one',
-    });
-    expect(native).toMatchObject({
-      skipped: true,
-      skipReason: 'xtream-max-connections-at-most-one',
-    });
-    expect(execFile).not.toHaveBeenCalled();
-    expect(JSON.stringify({ webview: probe.playlists[0].webview, native }))
-      .not.toContain('user1');
-    expect(JSON.stringify({ webview: probe.playlists[0].webview, native }))
-      .not.toContain('pass1');
-  });
-
-  it('captures each <source> type with its canPlayType verdict', async () => {
-    document.body.innerHTML =
-      '<video><source src="http://host/movie/u1/p1/7.mkv" type="video/x-matroska"></video>';
-    const video = document.querySelector('video');
-    video.canPlayType = (type) => (type === 'video/mp4' ? 'probably' : '');
-
-    const probe = await runProbe();
-
-    expect(probe.state.media.sources).toEqual([{
-      src: 'http://host/movie/u1/p1/7.mkv',
-      type: 'video/x-matroska',
-      canPlayType: '',
-    }]);
-    expect(probe.state.codecSupport['video/mp4']).toBe('probably');
-    expect(probe.state.codecSupport['video/x-matroska']).toBe('');
-  });
-
-  it('probes container support even with no <video> on the page', async () => {
-    const probe = await runProbe();
-
-    expect(probe.state.media).toBeNull();
-    expect(Object.keys(probe.state.codecSupport)).toContain('video/x-matroska');
-    expect(Object.keys(probe.state.codecSupport)).toContain('audio/mp4; codecs="ec-3"');
+    await expect(evaluateOnLegacyEngine(client, 'Promise.reject(new Error("Bravo"))', async () => {}))
+      .rejects.toThrow('Error: Bravo');
   });
 });
