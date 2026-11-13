@@ -22,6 +22,8 @@ export interface Channel {
   sourceAttributes?: Record<string, string>;
   /** Headers declared by EXTHTTP, preserved for playback backends that support them. */
   httpHeaders?: Record<string, string>;
+  /** The raw `|Name=value` header suffix split off `url`; part of the identity. */
+  urlSuffix?: string;
   /** Optional logical channel number declared by the source. */
   channelNumber?: number;
   /** EPG shift in hours declared by tvg-shift/timeshift. */
@@ -53,6 +55,15 @@ export interface Channel {
   catchupTimeZone?: string;
   /** Fixed fallback when the provider timezone is absent or unsupported. */
   catchupTimeOffsetMinutes?: number;
+}
+
+/** The last played live channel, for autoplay: the identities resolve it
+ *  most precise first (exact, stream, key), the index last. */
+export interface LastChannel {
+  index: number;
+  key?: string;
+  stream?: string;
+  exact?: string;
 }
 
 export type LivePlaybackStatus = 'loading' | 'playing' | 'buffering' | 'paused' | 'error';
@@ -373,6 +384,11 @@ export interface ChannelScope {
  *  the default) or stays within the launch scope above ('active'). */
 export type ChannelCycleMode = 'global' | 'active';
 
+/** How a channel whose playlist sets HTTP headers sends them: 'luna' through
+ *  the media service, 'proxy' through the bundled service's loopback proxy,
+ *  and 'off' plays it on the video element without them. */
+export type HeaderPlayback = 'off' | 'luna' | 'proxy';
+
 export type NavDirection = 'up' | 'down' | 'left' | 'right';
 
 export type Action =
@@ -467,6 +483,8 @@ export interface DashSubtitleSource {
   kind: 'webvtt' | 'native';
   url?: string;
   segments?: DashSubtitleSegment[];
+  // A dynamic MPD lists these segments itself, so only a re-read MPD has new ones.
+  needsManifestRefresh?: true;
 }
 
 /** A subtitle rendition declared by an HLS master or DASH MPD. */

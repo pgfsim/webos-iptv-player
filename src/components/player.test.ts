@@ -22,7 +22,7 @@ vi.mock('../services/epg-service', () => ({
 }));
 vi.mock('../services/storage-service', () => ({
   StorageService: {
-    setLastChannel: vi.fn(), setLastChannelKey: vi.fn(),
+    getLastChannel: vi.fn(() => null), setLastChannel: vi.fn(),
     getSubtitlePref: vi.fn(), setSubtitlePref: vi.fn(),
     getAudioPref: vi.fn(), setAudioPref: vi.fn(),
     setResume: vi.fn(), clearResume: vi.fn(),
@@ -33,6 +33,7 @@ vi.mock('../services/storage-service', () => ({
     getSubtitleOffset: vi.fn(() => 0), setSubtitleOffset: vi.fn(),
     getChannelCycleMode: vi.fn(() => 'global'),
     getLiveReconnectAttempts: vi.fn(() => 3),
+    getHeaderPlayback: vi.fn(() => 'off'),
     getPlayerOsdTimeoutMs: vi.fn(() => 5000),
     getPlaylists: vi.fn(() => [{
       id: 'x',
@@ -784,6 +785,76 @@ describe('Player live playback', () => {
     expect(reload).toHaveBeenCalledOnce();
   });
 
+  it('leaves a stall during a Luna start to the Luna deadline', async () => {
+    Object.defineProperties(video, {
+      readyState: { value: 0, configurable: true },
+      networkState: { value: 2, configurable: true },
+    });
+    player.play(0);
+    await flush();
+    const pipeline = (player as unknown as { pipeline: { isLunaStarting(): boolean } }).pipeline;
+    const starting = vi.spyOn(pipeline, 'isLunaStarting').mockReturnValue(true);
+    const reload = vi.spyOn(player as unknown as { reloadCurrentStream(): void }, 'reloadCurrentStream')
+      .mockImplementation(() => {});
+    const info = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const watchdog = (player as unknown as { stallWatchdog: { start(): void } }).stallWatchdog;
+    watchdog.start();
+    const freeze = CONFIG.PLAYER.STALL_POLL_MS * CONFIG.PLAYER.STALL_FREEZE_TICKS;
+
+    vi.advanceTimersByTime(freeze * 2);
+    expect(reload).not.toHaveBeenCalled();
+    const held = info.mock.calls.map(args => args.join(' '))
+      .filter(text => text.includes('event=playback.luna.stall.held'));
+    expect(held).toHaveLength(1);
+    expect(held[0]).toContain('reloads=0/3');
+
+    // Fallen back to the element: its stall reloads with the full budget.
+    starting.mockReturnValue(false);
+    vi.advanceTimersByTime(freeze);
+    expect(reload).toHaveBeenCalledOnce();
+  });
+
+  it('gives the element a whole freeze window after a Luna fallback', async () => {
+    Object.defineProperties(video, {
+      readyState: { value: 0, configurable: true },
+      networkState: { value: 2, configurable: true },
+    });
+    player.play(0);
+    await flush();
+    const internals = player as unknown as {
+      pipeline: { isLunaStarting(): boolean; callbacks: { onPlaybackPathChange(): void } };
+      stallWatchdog: { start(): void };
+    };
+    const starting = vi.spyOn(internals.pipeline, 'isLunaStarting').mockReturnValue(true);
+    const reload = vi.spyOn(player as unknown as { reloadCurrentStream(): void }, 'reloadCurrentStream')
+      .mockImplementation(() => {});
+    internals.stallWatchdog.start();
+    // The first tick takes the baseline; the rest count frozen.
+    vi.advanceTimersByTime(CONFIG.PLAYER.STALL_POLL_MS * CONFIG.PLAYER.STALL_FREEZE_TICKS);
+
+    // The Luna deadline fires just before the tick that completes the freeze.
+    starting.mockReturnValue(false);
+    internals.pipeline.callbacks.onPlaybackPathChange();
+    vi.advanceTimersByTime(CONFIG.PLAYER.STALL_POLL_MS);
+    expect(reload).not.toHaveBeenCalled();
+
+    vi.advanceTimersByTime(CONFIG.PLAYER.STALL_POLL_MS * (CONFIG.PLAYER.STALL_FREEZE_TICKS - 1));
+    expect(reload).toHaveBeenCalledOnce();
+  });
+
+  it('keeps a recovery reload after a Luna fallback on the element', async () => {
+    player.play(0);
+    await flush();
+    const pipeline = (player as unknown as {
+      pipeline: { load(url: string, extras: unknown, opts?: { reload?: boolean }): void };
+    }).pipeline;
+    const load = vi.spyOn(pipeline, 'load');
+    vi.spyOn(player as unknown as { recreateVideoEl(): void }, 'recreateVideoEl')
+      .mockImplementation(() => {});
+    (player as unknown as { reloadCurrentStream(): void }).reloadCurrentStream();
+    expect(load.mock.calls[0][2]).toEqual(expect.objectContaining({ reload: true }));
+  });
+
   it('does not retry a live stream the user pauses after playback starts', async () => {
     Object.defineProperties(video, {
       paused: { get: () => true, configurable: true },
@@ -802,6 +873,333 @@ describe('Player live playback', () => {
       CONFIG.PLAYER.STALL_POLL_MS * CONFIG.PLAYER.STALL_FREEZE_TICKS * 2,
     );
     expect(reload).not.toHaveBeenCalled();
+  });
+
+  it('logs the Luna stream URL, not the placeholder, on a Luna playback error', () => {
+    playlistMock.channels = [{}, {}];
+    HTMLMediaElement.prototype.play = vi.fn().mockResolvedValue(undefined);
+    HTMLMediaElement.prototype.load = vi.fn();
+    video = document.createElement('video');
+    Object.defineProperty(video, 'currentSrc', {
+      configurable: true, get: () => `http://app/${CONFIG.PLAYER.LUNA_MEDIA_PLACEHOLDER}`,
+    });
+    container.appendChild(video);
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    player.init(video);
+    const pipeline = (player as unknown as { pipeline: { lunaStreamUrl(): string } }).pipeline;
+    vi.spyOn(pipeline, 'lunaStreamUrl').mockReturnValue('http://host/live/u/p/1.m3u8');
+    player.play(0);
+
+    video.dispatchEvent(new Event('error'));
+
+    const line = error.mock.calls.map(args => args.join(' '))
+      .find(text => text.includes('event=playback.video.error'));
+    expect(line).toContain(diagnosticStreamUrl('http://host/live/u/p/1.m3u8'));
+    expect(line).not.toContain(CONFIG.PLAYER.LUNA_MEDIA_PLACEHOLDER);
+  });
+
+  it('logs the channel URL, not the placeholder, on an error after a Luna fallback', () => {
+    playlistMock.channels = [{}, {}];
+    HTMLMediaElement.prototype.play = vi.fn().mockResolvedValue(undefined);
+    HTMLMediaElement.prototype.load = vi.fn();
+    video = document.createElement('video');
+    // The restored element keeps the placeholder as currentSrc until its next
+    // resource selection.
+    Object.defineProperty(video, 'currentSrc', {
+      configurable: true, get: () => `file:///app/${CONFIG.PLAYER.LUNA_MEDIA_PLACEHOLDER}`,
+    });
+    container.appendChild(video);
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    player.init(video);
+    player.play(0);
+
+    video.dispatchEvent(new Event('error'));
+
+    const line = error.mock.calls.map(args => args.join(' '))
+      .find(text => text.includes('event=playback.video.error'));
+    expect(line).toContain(diagnosticStreamUrl(CHANNEL.url));
+    expect(line).not.toContain(CONFIG.PLAYER.LUNA_MEDIA_PLACEHOLDER);
+  });
+
+  it('hands a channel that never started to the next header step instead of reconnecting', () => {
+    playlistMock.channels = [{}, {}];
+    HTMLMediaElement.prototype.play = vi.fn().mockResolvedValue(undefined);
+    HTMLMediaElement.prototype.load = vi.fn();
+    video = document.createElement('video');
+    container.appendChild(video);
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    player.init(video);
+    const pipeline = (player as unknown as { pipeline: { escalate(): boolean } }).pipeline;
+    const retry = vi.spyOn(pipeline, 'escalate').mockReturnValue(true);
+    player.play(0);
+
+    video.dispatchEvent(new Event('error'));
+
+    expect(retry).toHaveBeenCalledOnce();
+    expect(error.mock.calls.map(args => args.join(' ')).join('\n'))
+      .not.toContain('event=playback.video.error');
+
+    retry.mockClear();
+    video.dispatchEvent(new Event('playing'));
+    video.dispatchEvent(new Event('error'));
+    expect(retry).not.toHaveBeenCalled();
+    expect(error.mock.calls.map(args => args.join(' ')).join('\n'))
+      .toContain('event=playback.video.error');
+  });
+
+  it('reopens a proxied stream that had played once, then takes the normal error path', () => {
+    playlistMock.channels = [{}, {}];
+    HTMLMediaElement.prototype.play = vi.fn().mockResolvedValue(undefined);
+    HTMLMediaElement.prototype.load = vi.fn();
+    video = document.createElement('video');
+    container.appendChild(video);
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    player.init(video);
+    const internals = player as unknown as {
+      pipeline: { isProxied(): boolean };
+      reloadCurrentStream(): void;
+    };
+    vi.spyOn(internals.pipeline, 'isProxied').mockReturnValue(true);
+    const reload = vi.spyOn(internals, 'reloadCurrentStream').mockImplementation(() => {});
+    player.play(0);
+    video.dispatchEvent(new Event('playing'));
+
+    video.dispatchEvent(new Event('error'));
+
+    expect(reload).toHaveBeenCalledOnce();
+    expect(warn.mock.calls.map(args => args.join(' ')).join('\n'))
+      .toContain('event=playback.proxy.reopen');
+    expect(error.mock.calls.map(args => args.join(' ')).join('\n'))
+      .not.toContain('event=playback.video.error');
+
+    video.dispatchEvent(new Event('error'));
+    expect(reload).toHaveBeenCalledOnce();
+    expect(error.mock.calls.map(args => args.join(' ')).join('\n'))
+      .toContain('event=playback.video.error');
+  });
+
+  it('does not reopen a proxy session for a stream that never started', () => {
+    playlistMock.channels = [{}, {}];
+    HTMLMediaElement.prototype.play = vi.fn().mockResolvedValue(undefined);
+    HTMLMediaElement.prototype.load = vi.fn();
+    video = document.createElement('video');
+    container.appendChild(video);
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    player.init(video);
+    const internals = player as unknown as {
+      pipeline: { isProxied(): boolean };
+      reloadCurrentStream(): void;
+      onStartupFailure(failure: 'unsupported', probe: { readyState: number; networkState: number }, ms: number): void;
+    };
+    vi.spyOn(internals.pipeline, 'isProxied').mockReturnValue(true);
+    const reload = vi.spyOn(internals, 'reloadCurrentStream').mockImplementation(() => {});
+    player.play(0);
+
+    internals.onStartupFailure('unsupported', { readyState: 0, networkState: 2 }, 10000);
+
+    expect(reload).not.toHaveBeenCalled();
+    expect(warn.mock.calls.map(args => args.join(' ')).join('\n'))
+      .not.toContain('event=playback.proxy.reopen');
+    expect(error.mock.calls.map(args => args.join(' ')).join('\n'))
+      .toContain('event=playback.video.error');
+  });
+
+  it('treats the proxy step a played Luna stream moved to as unstarted', () => {
+    playlistMock.channels = [{}, {}];
+    HTMLMediaElement.prototype.play = vi.fn().mockResolvedValue(undefined);
+    HTMLMediaElement.prototype.pause = vi.fn();
+    HTMLMediaElement.prototype.load = vi.fn();
+    video = document.createElement('video');
+    container.appendChild(video);
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    player.init(video);
+    const internals = player as unknown as {
+      pipeline: {
+        isProxied(): boolean; isHeaderChain(): boolean;
+        callbacks: { onStepRestarted(): void };
+      };
+      reloadCurrentStream(): void;
+      startupWatchdog: { start(): void };
+    };
+    vi.spyOn(internals.pipeline, 'isProxied').mockReturnValue(true);
+    vi.spyOn(internals.pipeline, 'isHeaderChain').mockReturnValue(true);
+    const reload = vi.spyOn(internals, 'reloadCurrentStream').mockImplementation(() => {});
+    const watchdog = vi.spyOn(internals.startupWatchdog, 'start');
+    player.play(0);
+    video.dispatchEvent(new Event('playing'));
+    watchdog.mockClear();
+
+    internals.pipeline.callbacks.onStepRestarted();
+    expect(watchdog).toHaveBeenCalled();
+    playlistMock.getByIndex.mockClear();
+    video.dispatchEvent(new Event('error'));
+    vi.advanceTimersByTime(2000);
+
+    expect(reload).not.toHaveBeenCalled();
+    expect(warn.mock.calls.map(args => args.join(' ')).join('\n'))
+      .not.toContain('event=playback.proxy.reopen');
+    expect(playlistMock.getByIndex).toHaveBeenCalledWith(1);
+    expect(error.mock.calls.map(args => args.join(' ')).join('\n'))
+      .toMatch(/event=playback\.recovery\.exhausted .*chain=unstarted/);
+  });
+
+  it('reconnects a live channel that played when its reload finds the source gone', () => {
+    playlistMock.channels = [{}, {}];
+    HTMLMediaElement.prototype.play = vi.fn().mockResolvedValue(undefined);
+    HTMLMediaElement.prototype.pause = vi.fn();
+    HTMLMediaElement.prototype.load = vi.fn();
+    video = document.createElement('video');
+    container.appendChild(video);
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    player.init(video);
+    const internals = player as unknown as {
+      reloadCurrentStream(): void;
+      onStartupFailure(failure: 'unsupported', probe: { readyState: number; networkState: number }, ms: number): void;
+    };
+    player.play(0);
+    video.dispatchEvent(new Event('playing'));
+    internals.reloadCurrentStream();
+    playlistMock.getByIndex.mockClear();
+
+    internals.onStartupFailure('unsupported', { readyState: 0, networkState: 3 }, 500);
+    vi.advanceTimersByTime(2000);
+
+    expect(playlistMock.getByIndex).not.toHaveBeenCalledWith(1);
+    expect(warn.mock.calls.map(args => args.join(' ')).join('\n'))
+      .toMatch(/event=playback\.recovery\.reload .*cause=error .*reloads=1\//);
+  });
+
+  it('gives up on a header channel no step started instead of rerunning its chain', () => {
+    playlistMock.channels = [{}, {}];
+    HTMLMediaElement.prototype.play = vi.fn().mockResolvedValue(undefined);
+    HTMLMediaElement.prototype.pause = vi.fn();
+    HTMLMediaElement.prototype.load = vi.fn();
+    video = document.createElement('video');
+    container.appendChild(video);
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    player.init(video);
+    const pipeline = (player as unknown as { pipeline: { isHeaderChain(): boolean } }).pipeline;
+    vi.spyOn(pipeline, 'isHeaderChain').mockReturnValue(true);
+    player.play(0);
+    playlistMock.getByIndex.mockClear();
+
+    video.dispatchEvent(new Event('error'));
+    vi.advanceTimersByTime(2000);
+
+    expect(container.querySelector('video')).toBe(video);
+    expect(playlistMock.getByIndex).toHaveBeenCalledWith(1);
+    expect(error.mock.calls.map(args => args.join(' ')).join('\n'))
+      .toMatch(/event=playback\.recovery\.exhausted .*cause=error .*chain=unstarted/);
+  });
+
+  it('fails a channel only the proxy could play at once when the proxy is unavailable', async () => {
+    playlistMock.channels = [{}, {}];
+    playlistMock.getByIndex.mockReturnValue({ ...CHANNEL, httpHeaders: { Referer: 'http://host/' } });
+    vi.mocked(StorageService.getHeaderPlayback).mockReturnValue('proxy');
+    vi.stubGlobal('fetch', vi.fn(async () => { throw new TypeError('Failed to fetch'); }));
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      player.play(0);
+      await vi.waitFor(() => expect(warn.mock.calls.map(args => args.join(' ')).join('\n'))
+        .toContain('event=playback.chain.stopped'));
+      playlistMock.getByIndex.mockClear();
+      vi.advanceTimersByTime(10000);
+
+      expect(warn.mock.calls.map(args => args.join(' ')).join('\n'))
+        .not.toContain('event=playback.recovery.reload');
+      expect(error.mock.calls.map(args => args.join(' ')).join('\n')
+        .match(/event=playback\.video\.error/g)).toHaveLength(1);
+      expect(playlistMock.getByIndex).toHaveBeenCalledWith(1);
+    } finally {
+      vi.mocked(StorageService.getHeaderPlayback).mockReturnValue('off');
+    }
+  });
+
+  it('leaves a header step that hangs to the startup watchdog, which escalates it', async () => {
+    playlistMock.channels = [{}, {}];
+    Object.assign(video, { readyState: 0, networkState: 2 });
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const internals = player as unknown as {
+      pipeline: { isHeaderChain(): boolean; canEscalate(): boolean; escalate(): boolean };
+      stallWatchdog: { start(): void };
+    };
+    vi.spyOn(internals.pipeline, 'isHeaderChain').mockReturnValue(true);
+    vi.spyOn(internals.pipeline, 'canEscalate').mockReturnValue(true);
+    const escalate = vi.spyOn(internals.pipeline, 'escalate').mockReturnValue(true);
+    player.play(0);
+    await flush();
+    video.dispatchEvent(new Event('loadstart'));
+    internals.stallWatchdog.start();
+    playlistMock.getByIndex.mockClear();
+
+    vi.advanceTimersByTime(CONFIG.PLAYER.STALL_POLL_MS * (CONFIG.PLAYER.STALL_FREEZE_TICKS + 1));
+    expect(escalate).not.toHaveBeenCalled();
+    expect(playlistMock.getByIndex).not.toHaveBeenCalled();
+
+    vi.advanceTimersByTime(CONFIG.PLAYER.STARTUP_TIMEOUT);
+    expect(escalate).toHaveBeenCalled();
+    expect(playlistMock.getByIndex).not.toHaveBeenCalled();
+  });
+
+  it('gives up on a hanging header chain with no step left, without rerunning it', async () => {
+    playlistMock.channels = [{}, {}];
+    Object.assign(video, { readyState: 0, networkState: 2 });
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const internals = player as unknown as {
+      pipeline: { isHeaderChain(): boolean; canEscalate(): boolean };
+      stallWatchdog: { start(): void };
+      reloadCurrentStream(): void;
+    };
+    vi.spyOn(internals.pipeline, 'isHeaderChain').mockReturnValue(true);
+    vi.spyOn(internals.pipeline, 'canEscalate').mockReturnValue(false);
+    const reload = vi.spyOn(internals, 'reloadCurrentStream');
+    player.play(0);
+    await flush();
+    video.dispatchEvent(new Event('loadstart'));
+    internals.stallWatchdog.start();
+    playlistMock.getByIndex.mockClear();
+
+    vi.advanceTimersByTime(CONFIG.PLAYER.STALL_POLL_MS * (CONFIG.PLAYER.STALL_FREEZE_TICKS + 1));
+
+    expect(reload).not.toHaveBeenCalled();
+    expect(playlistMock.getByIndex).toHaveBeenCalledWith(1);
+    expect(error.mock.calls.map(args => args.join(' ')).join('\n'))
+      .toMatch(/event=playback\.recovery\.exhausted .*cause=stall .*chain=unstarted/);
+  });
+
+  it('still reconnects a header channel that played before it stalled', () => {
+    playlistMock.channels = [{}, {}];
+    HTMLMediaElement.prototype.play = vi.fn().mockResolvedValue(undefined);
+    HTMLMediaElement.prototype.pause = vi.fn();
+    HTMLMediaElement.prototype.load = vi.fn();
+    video = document.createElement('video');
+    container.appendChild(video);
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    player.init(video);
+    const pipeline = (player as unknown as { pipeline: { isHeaderChain(): boolean } }).pipeline;
+    vi.spyOn(pipeline, 'isHeaderChain').mockReturnValue(true);
+    player.play(0);
+    video.dispatchEvent(new Event('playing'));
+    playlistMock.getByIndex.mockClear();
+
+    video.dispatchEvent(new Event('error'));
+    vi.advanceTimersByTime(2000);
+    const second = container.querySelector('video')!;
+    expect(second).not.toBe(video);
+
+    second.dispatchEvent(new Event('error'));
+    vi.advanceTimersByTime(2000);
+    expect(container.querySelector('video')).not.toBe(second);
+    expect(playlistMock.getByIndex).not.toHaveBeenCalled();
   });
 
   it('coalesces errors and reconnects the same channel before advancing', async () => {
@@ -879,6 +1277,20 @@ describe('Player live playback', () => {
     expect(healthMock.recordPlaybackFailure).toHaveBeenCalledOnce();
   });
 
+  it('says HTTP headers are off when a channel that needed them fails', async () => {
+    playlistMock.channels = [{}, {}];
+    player.play(0);
+    await flush();
+    const pipeline = (player as unknown as { pipeline: { headersTurnedOff(): boolean } }).pipeline;
+    vi.spyOn(pipeline, 'headersTurnedOff').mockReturnValue(true);
+    Object.defineProperty(video, 'error', { configurable: true, value: { code: 4, message: '' } });
+
+    video.dispatchEvent(new Event('error'));
+
+    expect(container.querySelector('#player-osd')?.textContent)
+      .toContain('Playback error — HTTP headers are off. Trying the next channel…');
+  });
+
   it('cancels a pending reconnect when the user changes channel or stops', async () => {
     playlistMock.channels = [{}, {}];
     player.play(0);
@@ -920,6 +1332,167 @@ describe('Player live playback', () => {
     video.dispatchEvent(new Event('playing'));
     await flush();
     expect(onHealthChanged).toHaveBeenCalledOnce();
+  });
+});
+
+describe('Player Luna suspend and resume', () => {
+  type LunaPipeline = { isLunaActive(): boolean; lunaClock(): (() => number) | null };
+
+  function startOnLuna(duration: number, at: number) {
+    HTMLMediaElement.prototype.play = vi.fn().mockResolvedValue(undefined);
+    HTMLMediaElement.prototype.load = vi.fn();
+    const v = document.createElement('video');
+    let paused = false;
+    Object.defineProperties(v, {
+      duration: { value: duration, configurable: true },
+      paused: { get: () => paused, configurable: true },
+      pause: { value: () => { paused = true; }, configurable: true },
+    });
+    container.appendChild(v);
+    player.init(v);
+    player.play(0);
+    const pipeline = (player as unknown as { pipeline: LunaPipeline }).pipeline;
+    const active = vi.spyOn(pipeline, 'isLunaActive').mockReturnValue(true);
+    vi.spyOn(pipeline, 'lunaClock').mockReturnValue(() => at);
+    return { unload: () => active.mockReturnValue(false) };
+  }
+
+  // The element the resumed load plays on, with a working clock.
+  function reloaded(duration: number) {
+    const fresh = player.getVideoElement()!;
+    let time = 0;
+    const pause = vi.fn();
+    Object.defineProperties(fresh, {
+      duration: { value: duration, configurable: true },
+      currentTime: { get: () => time, set: (t: number) => { time = t; }, configurable: true },
+      pause: { value: pause, configurable: true },
+    });
+    return { fresh, pause, time: () => time };
+  }
+
+  const events = (spy: { mock: { calls: unknown[][] } }, name: string) => spy.mock.calls
+    .map(args => args.join(' ')).filter(text => text.includes(`event=${name} `));
+
+  it('reloads a paused finite stream at its position and pauses it again', () => {
+    const luna = startOnLuna(60, 11.1);
+    (player as unknown as { pauseToggle(): void }).pauseToggle();
+    const info = vi.spyOn(console, 'log').mockImplementation(() => {});
+
+    player.suspend();
+    luna.unload();
+    player.resume();
+    const { fresh, pause, time } = reloaded(60);
+    fresh.dispatchEvent(new Event('loadedmetadata'));
+    expect(time()).toBe(11.1);
+    expect(pause).not.toHaveBeenCalled();
+    fresh.dispatchEvent(new Event('playing'));
+
+    expect(pause).toHaveBeenCalledOnce();
+    expect((player as unknown as { userPaused: boolean }).userPaused).toBe(true);
+    expect(events(info, 'playback.luna.suspend')).toEqual([
+      expect.stringContaining('kind=finite atS=10 paused=1'),
+    ]);
+    expect(events(info, 'playback.luna.resume')).toEqual([
+      expect.stringContaining('atS=10 paused=1'),
+    ]);
+    fresh.dispatchEvent(new Event('playing'));
+    expect(pause).toHaveBeenCalledOnce();
+  });
+
+  function startProxied(duration: number, at: number) {
+    HTMLMediaElement.prototype.play = vi.fn().mockResolvedValue(undefined);
+    HTMLMediaElement.prototype.load = vi.fn();
+    const v = document.createElement('video');
+    let paused = false;
+    Object.defineProperties(v, {
+      duration: { value: duration, configurable: true },
+      currentTime: { get: () => at, set: () => {}, configurable: true },
+      paused: { get: () => paused, configurable: true },
+    });
+    container.appendChild(v);
+    player.init(v);
+    const pipeline = (player as unknown as { pipeline: { isProxied(): boolean } }).pipeline;
+    vi.spyOn(pipeline, 'isProxied').mockReturnValue(true);
+    player.play(0);
+    v.dispatchEvent(new Event('playing'));
+    return Object.assign(v, { systemPause: () => { paused = true; } });
+  }
+
+  type ProxyCallbacks = { pipeline: { callbacks: { onProxyExpired(): void } }; pendingSeekTarget: number | null };
+
+  it('releases a proxied stream the TV paused before hiding the app, and resumes it where it was', () => {
+    const v = startProxied(60, 11.1);
+    const info = vi.spyOn(console, 'log').mockImplementation(() => {});
+    v.systemPause();
+
+    player.suspend();
+    expect(player.getVideoElement()).not.toBe(v);
+    player.resume();
+    const { fresh, pause, time } = reloaded(60);
+    fresh.dispatchEvent(new Event('loadedmetadata'));
+    fresh.dispatchEvent(new Event('playing'));
+
+    expect(time()).toBe(11.1);
+    expect(pause).not.toHaveBeenCalled();
+    expect(events(info, 'playback.luna.suspend')).toEqual([
+      expect.stringContaining('kind=finite atS=10 paused=0'),
+    ]);
+  });
+
+  it('reopens a session the service expired under a played stream, at its pending seek', () => {
+    const v = startProxied(60, 11.1);
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const internals = player as unknown as ProxyCallbacks;
+    internals.pendingSeekTarget = 30;
+
+    internals.pipeline.callbacks.onProxyExpired();
+    const { fresh, time } = reloaded(60);
+    fresh.dispatchEvent(new Event('loadedmetadata'));
+
+    expect(fresh).not.toBe(v);
+    expect(time()).toBe(30);
+  });
+
+  it('reopens an expired proxy session for a finite stream where it was', () => {
+    const v = startProxied(60, 11.1);
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    v.dispatchEvent(new Event('error'));
+    const { fresh, time } = reloaded(60);
+    fresh.dispatchEvent(new Event('loadedmetadata'));
+
+    expect(fresh).not.toBe(v);
+    expect(time()).toBe(11.1);
+  });
+
+  it('resumes a proxied finite stream hidden while it played where it was', () => {
+    startProxied(60, 11.1);
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+
+    player.suspend();
+    player.resume();
+    const { fresh, time } = reloaded(60);
+    fresh.dispatchEvent(new Event('loadedmetadata'));
+
+    expect(time()).toBe(11.1);
+  });
+
+  it('reloads a playing live stream at its edge and keeps it playing', () => {
+    const luna = startOnLuna(Infinity, 30);
+    const info = vi.spyOn(console, 'log').mockImplementation(() => {});
+
+    player.suspend();
+    luna.unload();
+    player.resume();
+    const { fresh, pause, time } = reloaded(Infinity);
+    fresh.dispatchEvent(new Event('loadedmetadata'));
+    fresh.dispatchEvent(new Event('playing'));
+
+    expect(time()).toBe(0);
+    expect(pause).not.toHaveBeenCalled();
+    expect(events(info, 'playback.luna.suspend')).toEqual([
+      expect.stringContaining('kind=live atS=0 paused=0'),
+    ]);
   });
 });
 
@@ -1512,6 +2085,29 @@ describe('Player VOD mode', () => {
     expect(player.getPlaybackRateState()).toEqual({ available: true, rate: 1.5 });
   });
 
+  it('refreshes the player menu when the audio tracks change', () => {
+    const onStateChanged = vi.fn();
+    player = new Player(container, vi.fn(), undefined, undefined, undefined, onStateChanged);
+    player.init(fakeVideo(3600));
+    player.playVod(req());
+    onStateChanged.mockClear();
+    const pipeline = (player as unknown as {
+      pipeline: { callbacks: { onAudioTracksUpdated(): void } };
+    }).pipeline;
+
+    pipeline.callbacks.onAudioTracksUpdated();
+
+    expect(onStateChanged).toHaveBeenCalled();
+  });
+
+  it('does not offer playback speed while the Luna pipeline plays', () => {
+    player.init(fakeVideo(3600));
+    player.playVod(req());
+    const pipeline = (player as unknown as { pipeline: { isLunaActive(): boolean } }).pipeline;
+    vi.spyOn(pipeline, 'isLunaActive').mockReturnValue(true);
+    expect(player.getPlaybackRateState().available).toBe(false);
+  });
+
   it('logs why a playback speed change failed', async () => {
     const video = fakeVideo(3600);
     Object.defineProperty(video, 'playbackRate', { get: () => 1, set: () => {} });
@@ -1922,6 +2518,56 @@ describe('Player VOD mode', () => {
     expect(r.onBack).toHaveBeenCalled();
   });
 
+  it('logs the Luna stream URL, not the placeholder, when a Luna start fails', () => {
+    const video = fakeVideo(3600);
+    Object.assign(video, { readyState: 0, networkState: 2 });
+    Object.defineProperty(video, 'currentSrc', {
+      configurable: true, get: () => `http://app/${CONFIG.PLAYER.LUNA_MEDIA_PLACEHOLDER}`,
+    });
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    player.init(video);
+    const pipeline = (player as unknown as { pipeline: { lunaStreamUrl(): string } }).pipeline;
+    vi.spyOn(pipeline, 'lunaStreamUrl').mockReturnValue('http://host/live/u/p/1.m3u8');
+    player.playVod(req());
+    video.dispatchEvent(new Event('loadstart'));
+
+    vi.advanceTimersByTime(CONFIG.PLAYER.STARTUP_TIMEOUT);
+
+    const line = error.mock.calls.map(args => args.join(' '))
+      .find(text => text.includes('event=playback.startup.failed'));
+    expect(line).toContain(diagnosticStreamUrl('http://host/live/u/p/1.m3u8'));
+    expect(line).not.toContain(CONFIG.PLAYER.LUNA_MEDIA_PLACEHOLDER);
+  });
+
+  it('does not read the element\'s reload after a Luna fallback as a refused source', () => {
+    const video = fakeVideo(3600);
+    Object.assign(video, { readyState: 0, networkState: 2 });
+    player.init(video);
+    player.playVod(req());
+    video.dispatchEvent(new Event('loadstart'));
+    vi.advanceTimersByTime(CONFIG.PLAYER.LUNA_MEDIA_DEADLINE_MS - 200);
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.mocked(showToast).mockClear();
+
+    // The fallback reloads the element, which reads NETWORK_NO_SOURCE until
+    // resource selection runs in a later task.
+    const pipeline = player as unknown as {
+      pipeline: { callbacks: { onPlaybackPathChange(): void } };
+    };
+    pipeline.pipeline.callbacks.onPlaybackPathChange();
+    Object.assign(video, { networkState: 3 });
+    setTimeout(() => {
+      Object.assign(video, { networkState: 2 });
+      video.dispatchEvent(new Event('loadstart'));
+    }, 300);
+    vi.advanceTimersByTime(CONFIG.PLAYER.STARTUP_POLL_MS * 2);
+
+    expect(error.mock.calls.map(args => args.join(' ')).join('\n'))
+      .not.toContain('event=playback.startup.failed');
+    expect(showToast).not.toHaveBeenCalled();
+    expect(player.isVod()).toBe(true);
+  });
+
   it('stops watching once the stream starts', () => {
     const video = fakeVideo(3600);
     Object.assign(video, { readyState: 0, networkState: 2 });
@@ -2083,6 +2729,15 @@ describe('stream routing', () => {
     expect(diagnosticStreamUrl(
       'http://host/catchup/ch1.m3u8?start=10&end=20&auth=secret',
     )).toBe('http://host/catchup/ch1.m3u8?start=10&end=20&auth=***');
+  });
+
+  it('redacts the whole local proxy token and treats the upstream URL as a direct one', () => {
+    const token = 'ab'.repeat(16);
+    expect(diagnosticStreamUrl(
+      `http://127.0.0.1:8080/p/${token}/http/host/live/u1/p1/1.ts?token=x&start=10`,
+    )).toBe('http://127.0.0.1:8080/p/***/http/host/live/***/***/1.ts?token=***&start=10');
+    expect(diagnosticStreamUrl(`http://127.0.0.1:8080/p/${token}/https/host:8443/a.m3u8`))
+      .toBe('http://127.0.0.1:8080/p/***/https/host:8443/a.m3u8');
   });
 
   it('maps detected content types to native MIME values', () => {

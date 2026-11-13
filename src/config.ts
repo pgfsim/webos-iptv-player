@@ -53,6 +53,22 @@ export const CONFIG = {
     // Long live SegmentTimelines need a larger budget so the parser receives
     // complete MPD XML.
     MPD_MAX_BYTES: 1024 * 1024,
+    // A master or MPD the page was refused is read again through the bundled
+    // service, which may still be starting. DASH holds the Luna load for it,
+    // so its budget is shorter.
+    MANIFEST_SERVICE_GRACE_MS: 3000,
+    DASH_MANIFEST_SERVICE_TIMEOUT: 2500,
+    DASH_MANIFEST_SERVICE_GRACE_MS: 500,
+    // Opening a loopback proxy session; the first open may cold-start the service.
+    PROXY_OPEN_TIMEOUT: 5000,
+    PROXY_FIRST_OPEN_TIMEOUT: 8000,
+    // Under the service's 2-minute idle expiry, so a paused player keeps its session.
+    PROXY_TOUCH_INTERVAL: 45000,
+    // A channel with HTTP headers starts no further step after this long, so
+    // a dead stream does not wait out every step's deadline.
+    HEADER_CHAIN_CAP_MS: 25000,
+    // Desktop preview: the standalone service's proxy port (IPTV_PROXY_PORT).
+    DEV_PROXY_PORT: 47390,
     // mediaOption selects the native MPEG-DASH transport deterministically;
     // bare delegates selection to URI typefinding for provider compatibility.
     DASH_SOURCE: 'mediaOption' as 'mediaOption' | 'bare',
@@ -84,6 +100,24 @@ export const CONFIG = {
     SUBTITLE_OFFSET_MAX: 60,    // max |offset| the adjuster allows (seconds)
     SUBTITLE_SEARCH_TIMEOUT: 8000, // ms one online provider may take before the merged search gives up on it
     UP_NEXT_COUNTDOWN: 10,      // seconds before the queued episode/movie starts automatically
+    LUNA_MEDIA_PLACEHOLDER: 'resources/black.mp4',
+    LUNA_MEDIA_WINDOW_TIMEOUT_MS: 3000, // placeholder clip load + getForegroundAppInfo budget
+    LUNA_MEDIA_WINDOW_POLL_MS: 100,     // video.mediaId / window ID poll cadence
+    // Window lookup, load, and the first playing must finish within this, below
+    // STARTUP_TIMEOUT so the fallback <video> still gets its own chance.
+    LUNA_MEDIA_DEADLINE_MS: 12000,
+    LUNA_MEDIA_CALL_TIMEOUT_MS: 5000,   // one unanswered Luna call counts as failed
+    LUNA_MEDIA_FORCE_PLAY_MS: 2500,     // no loadCompleted after subscribe: send play anyway
+    LUNA_MEDIA_METADATA_WAIT_MS: 2000,  // hold loadedmetadata for sourceInfo's duration
+    LUNA_MEDIA_SEEK_TIMEOUT_MS: 5000,   // no seekDone within this ends the seek anyway
+    LUNA_MEDIA_PLACEHOLDER_QUIET_MS: 2000, // placeholder events stay hidden this long after restore
+    LUNA_MEDIA_TRANSIENT_FAILURES: 2,   // transient fallbacks before a channel stays off Luna
+    LUNA_MEDIA_NO_WINDOW_LIMIT: 3,      // no_window fallbacks (any channel) before Luna is off for the session
+    LUNA_MEDIA_CLOCK_STEP_MS: 1500,     // the playback clock runs on at most this far past a UMS position
+    LUNA_MEDIA_AUDIO_EVENT_MS: 1000,    // a successful selectTrack without trackSelected counts after this
+    LUNA_MEDIA_FROZEN_MS: 4000,         // playing time this long unchanged reports a stall to the watchdog
+    LUNA_MEDIA_DISPLAY_WIDTH: 1920,     // setDisplayWindow's app coordinate space
+    PLAYREADY_UNLOAD_WAIT_MS: 2000,     // a DRM load waits this long for an earlier client's unload
   },
 
   EPG: {

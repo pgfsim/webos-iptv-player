@@ -9,8 +9,14 @@ ClearKey and the desktop preview use Shaka through MSE.
 | Platform | Playback path | Track control |
 |---|---|---|
 | webOS, clear or PlayReady | Native `MPEG-DASH` transport | HTML5 audio tracks, self-rendered raw WebVTT, and the native subtitle compositor |
+| webOS, clear or PlayReady, with channel HTTP headers | Luna `com.webos.media/load` with `MPEG-DASH` transport | UMS `sourceInfo` audio tracks and self-rendered raw WebVTT on the Luna clock |
 | webOS, Widevine or ClearKey | Shaka DASH-only through MSE/EME | The `MseEngine` adapter |
+| webOS, Widevine or ClearKey, with channel HTTP headers, Local proxy | Shaka DASH-only through the loopback proxy | The `MseEngine` adapter |
 | Desktop preview | Shaka DASH-only | The `MseEngine` adapter |
+
+A header channel's Luna load may fall back to the native element or, in
+Local proxy mode, to the proxy; see
+[HTTP header playback](http-header-playback.md#escalation-chain).
 
 ## Shaka webOS compatibility
 
@@ -140,7 +146,9 @@ Native `stpp`, `wvtt` and CEA tracks may not appear as Blink `TextTrack`
 objects. Picker activation uses
 `com.webos.media/setSubtitleEnable` after the native media ID is available.
 Selection is applied again on `playing` because the media ID can appear after
-`loadedmetadata`.
+`loadedmetadata`. The compositor draws only the first native `stpp` or `wvtt`
+AdaptationSet, whatever its role or language, so the picker lists only that
+rendition.
 
 App `::cue` styling and subtitle offsets apply only to self-rendered raw WebVTT.
 Native compositor positioning and styling are controlled by the media stream
@@ -158,6 +166,16 @@ boundaries:
   window advances.
 
 The pads are configured by `DVR_GO_LIVE_PAD` and `DVR_OLDEST_PAD`.
+
+## Luna header playback
+
+A clear or PlayReady DASH channel with HTTP headers loads through
+`luna://com.webos.media/load` with the `MPEG-DASH` transport, as header
+HLS does; Widevine and ClearKey stay on Shaka, through the local proxy
+when that is enabled. See
+[HTTP header playback](http-header-playback.md#media-service-luna) for
+the escalation, the header-less MPD read, the PlayReady retry,
+subtitles, and audio.
 
 ## Native PlayReady DRM
 
@@ -272,6 +290,57 @@ Automated coverage includes:
 Native decode, extensionless detection, multiple audio AdaptationSets, raw
 WebVTT, `stpp`, `wvtt`, dynamic MPDs and DVR were tested on webOS TV 10.3.1.
 
+### Public test streams
+
+These vendor developer test streams reproduce the DRM paths on a TV.
+Load them through a local M3U; never hardcode them into code or tests.
+Availability can change.
+
+| DRM | Title | Manifest | License server |
+|---|---|---|---|
+| PlayReady | Tears of Steel 4K | `https://test.playready.microsoft.com/media/profficialsite/tearsofsteel_4k.ism/manifest.mpd` | `https://test.playready.microsoft.com/service/rightsmanager.asmx?cfg=(persist:false,sl:150)` |
+| PlayReady | Big Buck Bunny CBCS 1080p | `https://test.playready.microsoft.com/media/dash/APPLEENC_CBCS_BBB_1080p/1080p.mpd` | `https://test.playready.microsoft.com/service/rightsmanager.asmx?cfg=(persist:false,ck:W31bfVt9W31bfVt9W31bfQ==,ckt:aescbc)` |
+| Widevine | Angel One | `https://storage.googleapis.com/shaka-demo-assets/angel-one-widevine/dash.mpd` | `https://proxy.uat.widevine.com/proxy` |
+| ClearKey | Angel One | `https://storage.googleapis.com/shaka-demo-assets/angel-one-clearkey/dash.mpd` | `https://cwip-shaka-proxy.appspot.com/clearkey?_u3wDe7erb7v8Lqt8A3QDQ=ABEiM0RVZneImaq7zN3u_w` |
+
+The PlayReady streams come from Microsoft's PlayReady test server; the
+Widevine and ClearKey ones from Shaka Player's demo catalog
+(`demo/common/assets.js`). A plain GET on a Widevine or ClearKey license
+URL returns HTTP 400, which is expected without a CDM challenge. The
+Axinom multi-DRM vectors need an `X-AxDRM-Message` header whose value
+isn't public, so they can't be reproduced outside Shaka's hosted demo.
+
+Set the DRM with the Kodi properties above. Adding a header such as
+`#EXTVLCOPT:http-referrer=http://ref.test/` routes the channel through
+[HTTP header playback](http-header-playback.md); these servers ignore it.
+
+```m3u
+#EXTM3U
+#EXTINF:-1,PlayReady with Referer
+#KODIPROP:inputstream.adaptive.manifest_type=mpd
+#KODIPROP:inputstream.adaptive.license_type=com.microsoft.playready
+#KODIPROP:inputstream.adaptive.license_key=https://test.playready.microsoft.com/service/rightsmanager.asmx?cfg=(persist:false,sl:150)
+#EXTVLCOPT:http-referrer=http://ref.test/
+https://test.playready.microsoft.com/media/profficialsite/tearsofsteel_4k.ism/manifest.mpd
+```
+
+### Subtitle and caption test streams
+
+These unencrypted streams cover each DASH subtitle type.
+No DASH CEA-708 stream is listed; HLS ones are in `docs/hls-subtitles.md`.
+
+| Subtitles | Manifest |
+|---|---|
+| `wvtt` | `https://storage.googleapis.com/shaka-demo-assets/angel-one/dash.mpd` |
+| `wvtt` | `https://storage.googleapis.com/shaka-demo-assets/sintel-mp4-wvtt/dash.mpd` |
+| Raw TTML sidecar | `https://storage.googleapis.com/shaka-demo-assets/tos-ttml/dash.mpd` |
+| `stpp.ttml.im1t` | `https://demo.unified-streaming.com/k8s/features/stable/video/tears-of-steel/tears-of-steel-ttml.ism/.mpd` |
+| `stpp`, multiple languages | `https://livesim2.dashif.org/vod/testpic_2s/multi_subs.mpd` |
+| Raw TTML sidecar | `https://demo.unified-streaming.com/k8s/features/stable/no-handler-origin/tears-of-steel/tears-of-steel-ttml-sidecar.mpd` |
+| Raw TTML sidecar | `https://livesim2.dashif.org/vod/testpic_2s/ttml_subs.mpd` |
+| CEA-608 (`CC1`, `CC3`) | `https://livesim2.dashif.org/vod/testpic_2s/cea608.mpd` |
+| CEA-608, simulated live | `https://livesim2.dashif.org/livesim2/testpic_2s/cea608.mpd` |
+
 ## Known limitations
 
 - Widevine and ClearKey require compatible MSE codecs and their corresponding
@@ -279,4 +348,3 @@ WebVTT, `stpp`, `wvtt`, dynamic MPDs and DVR were tested on webOS TV 10.3.1.
 - Metadata and subtitle discovery use the first Period.
 - Multi-Period subtitle continuation, xlink, encrypted WebVTT, BaseURL failover
   and UTCTiming correction are not implemented.
-- Native `wvtt` positioning and styling have not been verified.

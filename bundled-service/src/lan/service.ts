@@ -10,14 +10,15 @@ import * as http from 'http';
 import { SetupActionStore } from '../setup/actions';
 import { SetupStateStore } from '../setup/state';
 import { startServer, type ServiceChangeEvent } from './server';
+import { createKeepAlive, type ActivityManagerLike } from '../keep-alive';
+import { createLogger } from '../logger';
+
+const log = createLogger('lan');
 
 // Minimal shape of the webos-service Service object this module uses.
 interface LunaService {
   register(method: string, handler: (msg: LunaMsg) => void): void;
-  activityManager: {
-    create(name: string, cb: () => void): void;
-    complete(name: string, cb: () => void): void;
-  };
+  activityManager: ActivityManagerLike;
 }
 
 type LunaMsg = {
@@ -34,7 +35,7 @@ type LunaMsg = {
 // no Luna bus. There are no push subscribers off-device, so onChange is a no-op.
 export function startLanStandalone(dataDir: string): void {
   startServer(0, dataDir, () => { /* no serviceEvents subscribers off-device */ })
-    .catch((err) => console.error('[lan] startServer failed:', err));
+    .catch((err) => log.error('startServer failed:', err));
 }
 
 // Wire the shared LAN feature onto the Luna service.
@@ -56,19 +57,19 @@ export function registerLanService(service: LunaService, dataDir: string): void 
   // `stop`, since the service process stays alive across the cycle (webos-service
   // holds the Luna bus connection, keeping Node's event loop running even after
   // we close the HTTP server and complete the keepAlive activity).
-  let keepAliveCreated = false;
+  const keepAlive = createKeepAlive(() => service.activityManager, 'keepAlive', log);
   let bindInProgress = false;
 
   function broadcastChange(event: ServiceChangeEvent): void {
     if (subscribers.length === 0) return;
-    console.log('[lan] broadcasting ' + event + ' to ' + subscribers.length + ' subscriber(s)');
+    log.info('broadcasting ' + event + ' to ' + subscribers.length + ' subscriber(s)');
     for (let i = 0; i < subscribers.length;) {
       const sub = subscribers[i];
       try {
         sub.respond({ event });
         i++;
       } catch (e) {
-        console.warn('[lan] subscriber respond failed, dropping:', e);
+        log.warn('subscriber respond failed, dropping:', e);
         subscribers.splice(i, 1);
       }
     }
@@ -77,22 +78,19 @@ export function registerLanService(service: LunaService, dataDir: string): void 
   function ensureServer(): void {
     if (server || bindInProgress) return;
     bindInProgress = true;
-    console.log('[lan] (re)binding HTTP server');
+    log.info('(re)binding HTTP server');
     startServer(0, dataDir, broadcastChange, setupActions, setupState).then((r) => {
       bindInProgress = false;
       server = r.server;
       actualPort = r.port;
-      console.log('[lan] HTTP server ready on port ' + actualPort);
-      if (!keepAliveCreated) {
-        service.activityManager.create('keepAlive', () => { /* keep service alive */ });
-        keepAliveCreated = true;
-      }
+      log.info('HTTP server ready on port ' + actualPort);
+      keepAlive.hold();
       // Drain any `start` calls that arrived before this bind finished.
       for (const m of pendingStarts) m.respond({ running: true, port: actualPort });
       pendingStarts.length = 0;
     }).catch((err) => {
       bindInProgress = false;
-      console.error('[lan] startServer failed:', err);
+      log.error('startServer failed:', err);
       const msg = err instanceof Error ? err.message : String(err);
       for (const m of pendingStarts) m.respond({ running: false, error: msg });
       pendingStarts.length = 0;
@@ -104,7 +102,7 @@ export function registerLanService(service: LunaService, dataDir: string): void 
   ensureServer();
 
   service.register('start', (msg) => {
-    console.log('[lan] start method invoked');
+    log.info('start method invoked');
     if (actualPort !== null) {
       msg.respond({ running: true, port: actualPort });
     } else {
@@ -126,27 +124,20 @@ export function registerLanService(service: LunaService, dataDir: string): void 
   // a subsequent `start` rebinds via ensureServer() — Luna does NOT need
   // to respawn us.
   service.register('stop', (msg) => {
-    console.log('[lan] stop method invoked');
+    log.info('stop method invoked');
     // Drop all push subscribers — their connections are scoped to this
     // service lifetime and would be stale after a restart anyway.
     const droppedSubs = subscribers.length;
     subscribers.length = 0;
-    try {
-      service.activityManager.complete('keepAlive', () => {
-        console.log('[lan] keepAlive activity completed');
-      });
-    } catch (e) {
-      console.warn('[lan] activityManager.complete failed (ignoring):', e);
-    }
-    keepAliveCreated = false;
+    keepAlive.release();
     const wasRunning = !!server;
     if (server) {
       const s = server;
       server = null;
       actualPort = null;
       s.close((err) => {
-        if (err) console.warn('[lan] server.close error:', err);
-        else console.log('[lan] HTTP server closed');
+        if (err) log.warn('server.close error:', err);
+        else log.info('HTTP server closed');
       });
     }
     msg.respond({ stopped: wasRunning, droppedSubscribers: droppedSubs });
@@ -157,7 +148,7 @@ export function registerLanService(service: LunaService, dataDir: string): void 
   service.register('serviceEvents', (msg) => {
     if (msg.isSubscription) {
       if (subscribers.indexOf(msg) < 0) subscribers.push(msg);
-      console.log('[lan] serviceEvents subscriber added, total=' + subscribers.length);
+      log.info('serviceEvents subscriber added, total=' + subscribers.length);
       // Per webos-service API: clients drop themselves by closing their end,
       // which the lib surfaces as a 'cancel' event on the msg. msg.cancel()
       // (no-arg) is a server-side trigger that we never need to call.
@@ -165,7 +156,7 @@ export function registerLanService(service: LunaService, dataDir: string): void 
         msg.on('cancel', () => {
           const index = subscribers.indexOf(msg);
           if (index >= 0) subscribers.splice(index, 1);
-          console.log('[lan] serviceEvents subscriber cancelled, total=' + subscribers.length);
+          log.info('serviceEvents subscriber cancelled, total=' + subscribers.length);
         });
       }
     }

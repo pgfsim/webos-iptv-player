@@ -44,17 +44,23 @@ account blocked (HTTP 403). In this fork:
   the catalogs download in the background. By the time you open Search it
   is usually instant. Search and the preload share one download, and closing
   Search does not cancel it.
-- **Kept in memory until the refresh interval.** The catalogs stay in memory
-  for the session until the **Xtream content catalog refresh interval** in Settings expires. The
-  catalogs (about 21 MB of movies and 5 MB of series on the test panel) are
-  too large for the TV's browser storage, so they are downloaded again on
-  the next launch.
+- **Kept until the refresh interval.** The catalogs stay in memory for the
+  session, and saved in the TV's browser storage across restarts, until the
+  **Xtream content catalog refresh interval** in Settings expires. On the
+  test panel that is about 20 MB of movies and 5 MB of series.
 - **Results appear early.** Queries run as soon as channels are indexed.
   Programs, movies and series join the results as each one arrives.
-- **The channel list is never evicted.** When storage is full, saving
-  catalogs or other caches no longer evicts the saved channel list. The
-  other write is skipped instead, so starting the app never re-downloads the
-  playlist because of Search.
+- **Storage sized for a 48 MB quota.** The original budgets half the quota,
+  which cannot hold a 20 MB channel list and both catalogs, so each launch
+  downloaded one again. This fork budgets the whole quota (record sizes are
+  measured as JSON, about a third more than the engine stores) and ignores
+  the origin's reported usage, which still counts deleted records until the
+  engine compacts. The engine's own quota error remains the hard limit.
+- **The channel list is never evicted.** When the engine refuses a write,
+  the app frees everything but the live channel list and retries, so
+  starting the app never re-downloads the playlist because of Search. A
+  channel list left under an older cache key is deleted, since nothing
+  reads it again.
 
 Measured on the NANO866NA with a large panel and the guide off:
 
@@ -170,6 +176,7 @@ alone. Switching it off gives the picture back to the TV at once.
 - **MPEG-DASH playback** — play clear and PlayReady `.mpd` channels through the native webOS pipeline, or Widevine/ClearKey through an on-demand Shaka MSE/EME path, with MPD track metadata, live DVR, and subtitle support ([details](docs/mpeg-dash.md))
 - **Native PlayReady DRM** — play protected MPEG-DASH channels on compatible webOS TVs through LG's DRM service and native hardware media pipeline, with license settings supplied by Kodi-style M3U properties ([details](docs/mpeg-dash.md))
 - **Widevine / ClearKey DRM** — load Shaka DASH-only on demand, with Kodi-style license URLs and request headers or validated inline ClearKey keys ([details](docs/mpeg-dash.md))
+- **Channel HTTP headers** — channels whose M3U sets a Referer, User-Agent, Cookie, or Authorization play through the TV's media service, or optionally a local proxy, with those headers ([details](docs/http-header-playback.md))
 - **Audio & subtitle tracks** — pick from the player menu, remembered per channel or VOD item; subtitles cover in-manifest WebVTT and CEA-608/708 (live), in-container / sidecar SRT/WebVTT/ASS (VOD), and online search (SubDL, OpenSubtitles, and Assrt) with a manual title box; online search remains available when bundled tracks exist, and subtitle timing can be adjusted live
 - **Playback speed** — choose 0.5×–2× for movies and episodes in file formats such as MP4 and MKV; live TV, catch-up, and HLS/DASH streams play at normal speed because the webOS native pipeline ignores rate changes for them
 - **On-screen display** — program title, progress, and a live stream-info readout (resolution, HDR, frame rate, codec, audio channels)
@@ -398,6 +405,7 @@ some of the features above:
 - [`docs/audio-track-selection.md`](docs/audio-track-selection.md) — how audio-track switching works on the native webOS player
 - [`docs/hls-subtitles.md`](docs/hls-subtitles.md) — how live HLS subtitles are handled on webOS (in-manifest types and their render paths)
 - [`docs/mpeg-dash.md`](docs/mpeg-dash.md) — how DASH detection, native playback, subtitles, and live DVR work
+- [`docs/http-header-playback.md`](docs/http-header-playback.md) — how channels that need a Referer, User-Agent, Cookie, or Authorization play through the TV's media service or the local proxy
 - [`docs/vod-subtitles.md`](docs/vod-subtitles.md) — how VOD (Xtream movies & episodes) subtitles work: in-container tracks plus sidecar SRT/WebVTT/ASS, and online subtitle search (SubDL, OpenSubtitles, Assrt)
 - [`docs/storage-and-data.md`](docs/storage-and-data.md) — what the app stores, where it lives, and how user data is separated from disposable caches
 - [`docs/lan-service.md`](docs/lan-service.md) — phone setup and M3U uploads over the bundled LAN service

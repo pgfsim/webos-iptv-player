@@ -12,6 +12,7 @@ import {
 } from './cdp-client.mjs';
 import {
   enableCdpLogs,
+  isLegacyCdpEngine,
   normalizeCdpLogEvent,
   subscribeCdpLogs,
 } from './cdp-logs.mjs';
@@ -110,6 +111,13 @@ ${formatOptions(DIAGNOSTIC_SPEC)}
 combined. Reports stay local and are never uploaded.`;
 
 const PREVIEW_BYTES = 2048;
+const SERVICE_LOG_LINES = 500;
+// Mirrors serviceLogDir() in bundled-service/src/service-log.ts.
+const SERVICE_LOG_TEMP_ROOT = [
+  'node_major=$(node -e \'process.stdout.write(process.versions.node.split(".")[0])\')',
+  'if [ "$node_major" -ge 20 ]; then temp_root=/media/developer/temp; else temp_root=/tmp; fi',
+].join('; ');
+const NO_SERVICE_LOG = '__IPTV_NO_SERVICE_LOG__';
 const PLAYLIST_PROBE_TIMEOUT_MS = 5000;
 const SINGLE_CONNECTION_SKIP_REASON = 'xtream-max-connections-at-most-one';
 const SAFE_QUERY_VALUES = new Set([
@@ -249,7 +257,13 @@ export class DiagnosticRedactor {
   text(value) {
     if (this.full) return String(value);
     let text = String(value);
-    for (const secret of this.secrets) text = text.split(secret).join(valueSummary(secret));
+    // A secret counts only as a whole token, so a short path segment cannot
+    // eat letters out of ordinary words.
+    for (const secret of this.secrets) {
+      const escaped = secret.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      text = text.replace(new RegExp(`(?<![A-Za-z0-9])${escaped}(?![A-Za-z0-9])`, 'g'),
+        () => valueSummary(secret));
+    }
     text = text.replace(/\bhttps?:\/\/[^\s"'<>]+/gi, (url) => this.url(url));
     for (const [host, replacement] of this.hosts) {
       text = text.split(host).join(replacement);
@@ -372,6 +386,7 @@ export function assembleDiagnosticReport({
   probe,
   native,
   nativeMetrics = null,
+  serviceLog = null,
   logs,
   networkEvents,
 }) {
@@ -439,7 +454,7 @@ export function assembleDiagnosticReport({
     } : null,
   } : null;
   return {
-    schemaVersion: 4,
+    schemaVersion: 5,
     capturedAt,
     redacted: !full,
     capture,
@@ -453,6 +468,10 @@ export function assembleDiagnosticReport({
     input: extractInputTimeline(safeLogs),
     xtream: extractXtreamTimeline(safeLogs),
     logs: safeLogs,
+    serviceLog: serviceLog ? {
+      lines: serviceLog.lines.map((line) => redactor.text(line)),
+      error: redactor.text(serviceLog.error),
+    } : null,
     network: normalizeNetworkRecords(networkEvents, redactor),
   };
 }
@@ -606,6 +625,21 @@ export function formatDiagnosticSummary(report) {
     `Warnings: ${String((report.logs ?? []).filter((entry) => entry.level === 'warning').length)}`,
   );
   lines.push(`Errors: ${String((report.logs ?? []).filter((entry) => entry.level === 'error').length)}`);
+  if (report.serviceLog?.error) {
+    lines.push(`Service log: unavailable (${report.serviceLog.error.split(/\r?\n/)[0]})`);
+  } else if (report.serviceLog) {
+    const serviceLines = report.serviceLog.lines;
+    const countLevel = (level) => serviceLines.filter((line) => line.split(' ')[1] === level).length;
+    // The file outlives app sessions, so show which time the lines cover.
+    const span = serviceLines.length
+      ? `, ${serviceLines[0].split(' ')[0]} to ${serviceLines[serviceLines.length - 1].split(' ')[0]}`
+      : '';
+    lines.push(
+      `Service log: ${String(serviceLines.length)} lines${span}`
+      + ` | warnings=${String(countLevel('warn'))}`
+      + ` errors=${String(countLevel('error'))}`,
+    );
+  }
   return lines.join('\n');
 }
 
@@ -1433,6 +1467,33 @@ export function runNativeProbe(url, { execFile = execFileSync } = {}) {
   }
 }
 
+export function readServiceLog({ execFile = execFileSync } = {}) {
+  const command = [
+    SERVICE_LOG_TEMP_ROOT,
+    'log="$temp_root/com.lennylxx.iptv.service.log"',
+    'if [ -e "$log" ] || [ -e "$log.1" ]; then'
+      + ` cat "$log.1" "$log" 2>/dev/null | tail -n ${String(SERVICE_LOG_LINES)};`
+      + ` else echo ${NO_SERVICE_LOG}; fi`,
+    'exit 0',
+  ].join('; ');
+  try {
+    const output = execFile(
+      path.join('scripts', 'tv.sh'),
+      ['run', command],
+      { encoding: 'utf8', timeout: 30000, maxBuffer: 4 * 1024 * 1024 },
+    );
+    const lines = output.replace(/^\s*Enter passphrase for key '[^']+':\s*/i, '')
+      .split(/\r?\n/).filter((line) => line.trim());
+    if (lines.indexOf(NO_SERVICE_LOG) >= 0) {
+      return { lines: [], error: 'no service log on the TV; has the service started?' };
+    }
+    return { lines, error: '' };
+  } catch (error) {
+    const detail = error?.stderr || error?.stdout || toErrorMessage(error);
+    return { lines: [], error: String(detail).trim() || toErrorMessage(error) };
+  }
+}
+
 export function runNativePlaylistProbe(playlist, options = {}) {
   if (playlist?.__skipNativeProbe) {
     return {
@@ -1466,15 +1527,56 @@ async function pollForTarget(options, dependencies) {
   throw lastError ?? new Error('Timed out waiting for app inspector');
 }
 
+const evaluationError = (result) => (result.exceptionDetails
+  ? new Error(result.exceptionDetails.exception?.description ?? result.exceptionDetails.text)
+  : null);
+
+const LEGACY_EVALUATION_TIMEOUT_MS = 60000;
+const LEGACY_EVALUATION_POLL_MS = 100;
+let legacyEvaluations = 0;
+
+// Chromium 53 can't parse the probes' ES2017+ syntax and returns a pending
+// Promise for awaitPromise, so the probe is lowered to its engine, parks its
+// result on window, and is polled.
+export async function evaluateOnLegacyEngine(client, expression, wait = delay) {
+  const slot = `__iptvDiag${String(++legacyEvaluations)}`;
+  const wrapped = `window.${slot} = { done: false };
+Promise.resolve(${expression}).then(
+  (value) => { window.${slot} = { done: true, value }; },
+  (error) => { window.${slot} = { done: true, error: String((error && error.stack) || error) }; },
+);`;
+  // Loaded on demand: esbuild can't start under the jsdom test environment.
+  const { transformSync } = await import('esbuild');
+  const started = await client.call('Runtime.evaluate', {
+    expression: transformSync(wrapped, { loader: 'js', target: 'chrome53' }).code,
+  });
+  const startError = evaluationError(started);
+  if (startError) throw startError;
+  const deadline = Date.now() + LEGACY_EVALUATION_TIMEOUT_MS;
+  for (;;) {
+    const polled = await client.call('Runtime.evaluate', {
+      expression: `(function () { var r = window.${slot}; if (r && r.done) delete window.${slot}; return r; })()`,
+      returnByValue: true,
+    });
+    const state = polled.result?.value;
+    if (state?.done) {
+      if (state.error) throw new Error(state.error);
+      return state.value;
+    }
+    if (Date.now() >= deadline) throw new Error('Timed out waiting for a page probe');
+    await wait(LEGACY_EVALUATION_POLL_MS);
+  }
+}
+
 const evaluate = async (client, expression) => {
+  if (isLegacyCdpEngine(client)) return evaluateOnLegacyEngine(client, expression);
   const result = await client.call('Runtime.evaluate', {
     expression,
     awaitPromise: true,
     returnByValue: true,
   });
-  if (result.exceptionDetails) {
-    throw new Error(result.exceptionDetails.exception?.description ?? result.exceptionDetails.text);
-  }
+  const error = evaluationError(result);
+  if (error) throw error;
   return result.result?.value;
 };
 
@@ -1603,6 +1705,7 @@ export async function captureDiagnostics(options, overrides = {}) {
       probe: effectiveProbe,
       native,
       nativeMetrics,
+      serviceLog: readServiceLog({ execFile: dependencies.execFile }),
       logs,
       networkEvents,
     });

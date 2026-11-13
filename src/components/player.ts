@@ -18,10 +18,21 @@ import {
   xtreamCredentialsFromLiveUrl,
 } from '../utils/xtream-url';
 import { show, hide } from '../utils/dom';
-import { channelKey } from '../utils/channel';
+import {
+  channelExactStreamIdentity,
+  channelExactStreamKey,
+  channelHttpHeaders,
+  channelKey,
+  channelStreamIdentity,
+  channelStreamKey,
+} from '../utils/channel';
 import { dvrWindow, dvrState, type DvrWindow } from '../utils/dvr';
 import { PlaylistService } from '../services/playlist-service';
-import { ParentalControlService, liveParentalRequest } from '../services/parental-control';
+import {
+  ParentalControlService,
+  liveParentalRequest,
+  parentalTargetKey,
+} from '../services/parental-control';
 import { EpgService } from '../services/epg-service';
 import { StorageService } from '../services/storage-service';
 import { CONFIG } from '../config';
@@ -36,7 +47,8 @@ import { ChannelHealthService } from '../services/channel-health';
 import { createLogger } from '../utils/logger';
 import { t } from '../i18n';
 import { showToast } from './toast';
-import { PlayerPipeline, type PipelineManifest } from './player-pipeline';
+import { PlayerPipeline, type PipelineLoadOptions, type PipelineManifest } from './player-pipeline';
+import type { Rectangle } from './player-presentation';
 import {
   PlaybackRateController,
   type PlaybackRate,
@@ -50,6 +62,17 @@ import {
 import { PlayerTracks } from './player-tracks';
 
 const log = createLogger('Player');
+
+interface LunaResume {
+  channel: Channel;
+  position: number;
+  paused: boolean;
+}
+
+// A coarse position for diagnostics, in 10 s steps.
+function secondsBucket(seconds: number): string {
+  return Number.isFinite(seconds) && seconds > 0 ? String(Math.floor(seconds / 10) * 10) : '0';
+}
 
 // True on the TV's webOS WebView; false in desktop preview / tests.
 const STREAMING_MIMES = new Set(['application/vnd.apple.mpegurl', 'application/dash+xml']);
@@ -81,6 +104,11 @@ export class Player {
   private pendingResumeSecs = 0;
   private pendingSeekTarget: number | null = null;
   private wasPlayingBeforeHide = false;
+  private hidden = false;
+  private syncOnResume = false;
+  // Counts rebinds that only swapped the channel object, so a deferred play
+  // can pick the copy a refresh put in its place.
+  private rebinds = 0;
   private dvrPauseTick: ReturnType<typeof setInterval> | null = null;
   // Catch-up progress checkpointing. Wall-clock time of the last periodic save;
   // reset to Date.now() on every new catch-up session so the first checkpoint
@@ -107,8 +135,21 @@ export class Player {
   private stallWatchdog: StallWatchdog;
   private startupWatchdog: StartupWatchdog;
   private startupPending = false;
+  private proxyReopened = false;
+  // A frame came from the current load, or from any load since the user's.
+  private loadPlayed = false;
+  private channelPlayed = false;
+  // A reopened proxy session seeks back to where a finite stream was.
+  private reopenResume = false;
   // The user paused the element; startup, reloads, and `play` clear it.
   private userPaused = false;
+  private lunaStallHeldLoad = -1; // one playback.luna.stall.held event per load
+  // Hiding unloads Luna even when paused, unlike the element; resume reloads
+  // at this position (0 for live) and pauses again once playing.
+  private lunaResume: LunaResume | null = null;
+  private lunaRestore: LunaResume | null = null;
+  // The user's mute while a paused restore plays silently, until it pauses.
+  private lunaRestoreMute: boolean | null = null;
   private liveSessionActive = false;
   private playbackActive = false;
   private livePreviewMode = false;
@@ -150,21 +191,46 @@ export class Player {
       playbackLabel: loadToken => this.playbackLabel(loadToken),
       mediaState: video => this.mediaState(video),
       isCatchup: () => this.catchupInfo !== null,
+      headerPlayback: () => StorageService.getHeaderPlayback(),
       onError: reason => this.onError(reason),
       onAudioTracksUpdated: () => {
         this.tracks.applyHlsAudioSelection();
+        this.tracks.applyLunaAudioSelection();
         if (this.osd.isVisible()) this.osd.render();
+        // A Luna switch confirms later, so the open menu's Audio row needs it too.
+        this.onPlaybackStateChanged();
       },
       onSubtitleTracksUpdated: () => {
         this.tracks.applyHlsSubtitleSelection();
         if (this.osd.isVisible()) this.osd.render();
       },
       onManifest: manifest => this.applyPipelineManifest(manifest),
+      onPlaybackPathChange: () => {
+        this.tracks.stopSelfRender();
+        // A path change reloads the element, which reads NETWORK_NO_SOURCE
+        // until its resource selection runs: a tick due now would call that
+        // source refused.
+        if (this.startupPending) this.startupWatchdog.start();
+        // Frozen ticks counted against Luna would reload the fallback source
+        // in the same instant it starts.
+        this.stallWatchdog.restartFreeze();
+      },
+      // A Luna stream that failed after playing moved to the proxy: that
+      // step has its own start to make, and its failure must not rerun Luna.
+      onStepRestarted: () => {
+        this.loadPlayed = false;
+        this.channelPlayed = false;
+        this.startupPending = true;
+        this.startupWatchdog.start();
+      },
+      onProxyExpired: () => this.onError(),
     });
     this.tracks = new PlayerTracks(this.pipeline, {
       getVideoElement: () => this.videoEl,
       getChannel: () => this.currentChannel,
       getVod: () => this.vod,
+      playbackLabel: () => this.playbackLabel(),
+      onChanged: () => this.onPlaybackStateChanged(),
     });
     this.playbackRate = new PlaybackRateController(() => this.videoEl, {
       onFallback: rate => this.onPlaybackRateFallback(rate),
@@ -206,11 +272,17 @@ export class Player {
         log.error('Live stream recovery exhausted; advancing channel',
           'event=playback.recovery.exhausted', this.playbackLabel(),
           `cause=${recovery.cause}`,
-          this.recoveryState(recovery));
+          this.recoveryState(recovery),
+          ...(this.chainUnstarted() ? ['chain=unstarted'] : []));
         this.markLiveUnavailable(recovery.cause === 'stall' ? 'stall_exhausted' : 'playback_error');
-        this.osd.updateMessage(t('player.streamError'));
+        this.osd.updateMessage(this.streamErrorMessage());
         this.channelUp();
       },
+      // A step that hangs is the startup watchdog's to escalate.
+      holdStall: recovery => this.holdStallForLuna(recovery)
+        || (this.startupPending && this.pipeline.canEscalate()),
+      // A reload reruns a header chain from its first step, past HEADER_CHAIN_CAP_MS.
+      canReload: () => !this.chainUnstarted(),
       pollMs: CONFIG.PLAYER.STALL_POLL_MS,
       freezeTicks: CONFIG.PLAYER.STALL_FREEZE_TICKS,
       maxReloads: CONFIG.PLAYER.DEFAULT_LIVE_RECONNECT_ATTEMPTS,
@@ -287,12 +359,13 @@ export class Player {
         this.logVodTracks(el);
         this.vodTracksLatePending = true;
       }
-      if ((this.vod || this.catchupInfo) && this.pendingResumeSecs > 0 && Number.isFinite(el.duration) && el.duration > 0) {
+      if ((this.vod || this.catchupInfo || this.lunaRestore || this.reopenResume) && this.pendingResumeSecs > 0 && Number.isFinite(el.duration) && el.duration > 0) {
         const target = Math.min(this.pendingResumeSecs, el.duration - 1);
         log.info('resume seek', this.videoLabel(el), '| requested:', this.pendingResumeSecs,
           '| target:', target, '| duration:', el.duration);
         el.currentTime = target;
         this.pendingResumeSecs = 0;
+        this.reopenResume = false;
       }
       this.tracks.applyNativeAudioSelection();
       this.tracks.applyNativeSubtitleSelection();
@@ -306,6 +379,8 @@ export class Player {
     });
     onCurrent('loadeddata', () => {
       this.startupPending = false;
+      this.notePlayed();
+      this.pipeline.notePlaying();
       if (this.catchupInfo) this.catchupVariantConfirmed = true;
     });
     // Intrinsic size changes mid-stream (ABR up/down-switch) so the OSD pills
@@ -331,6 +406,8 @@ export class Player {
     });
     onCurrent('playing', () => {
       this.startupPending = false;
+      this.notePlayed();
+      this.pipeline.notePlaying();
       const recovered = this.errorRetryPending;
       if (recovered) {
         this.cancelErrorAdvance();
@@ -347,6 +424,7 @@ export class Player {
       if (this.resyncing) this.endResync();
       this.confirmLiveHistory(el);
       if (this.osd.isVisible()) this.osd.resetTimer();
+      this.finishLunaRestore(el);
     });
     onCurrent('waiting', () => {
       update('buffering');
@@ -388,6 +466,28 @@ export class Player {
     });
   }
 
+  private finishLunaRestore(el: HTMLVideoElement): void {
+    const restore = this.lunaRestore;
+    if (!restore) return;
+    this.lunaRestore = null;
+    if (restore.paused) {
+      this.userPaused = true;
+      // Luna answers its pause command asynchronously; unmute after it lands.
+      const paused = el.pause() as unknown;
+      void Promise.resolve(paused).then(() => this.endLunaRestoreMute(el));
+    }
+    log.info('Playback restored after a Luna suspend', 'event=playback.luna.resume',
+      this.playbackLabel(), `atS=${secondsBucket(el.currentTime)}`, `paused=${restore.paused ? 1 : 0}`,
+      `path=${this.pipeline.isLunaActive() ? 'luna' : 'native'}`);
+  }
+
+  private endLunaRestoreMute(el: HTMLVideoElement): void {
+    const muted = this.lunaRestoreMute;
+    if (muted === null || el !== this.videoEl) return;
+    this.lunaRestoreMute = null;
+    el.muted = muted;
+  }
+
   private playbackLabel(load = this.pipeline.currentLoadToken()): string {
     return `session=${String(this.playbackGeneration)} load=${String(load)}`;
   }
@@ -410,11 +510,30 @@ export class Player {
       ` paused=${String(p.paused)} seeking=${String(p.seeking)}`;
   }
 
+  // A reload would restart Luna before its deadline could fall back to the
+  // element, so a server that never answers would never leave Luna.
+  private holdStallForLuna(recovery: StallRecovery): boolean {
+    if (!this.pipeline.isLunaStarting()) return false;
+    const load = this.pipeline.currentLoadToken();
+    if (this.lunaStallHeldLoad !== load) {
+      this.lunaStallHeldLoad = load;
+      log.info('Stall left to the Luna start deadline', 'event=playback.luna.stall.held',
+        this.playbackLabel(load), this.recoveryState(recovery));
+    }
+    return true;
+  }
+
   suspend(): void {
+    this.hidden = true;
     this.startupWatchdog.stop();
     if (!this.videoEl || !this.currentChannel) return;
     if (this.wasPlayingBeforeHide) return; // already suspended
-    this.wasPlayingBeforeHide = !this.videoEl.paused;
+    // A Luna pipeline lives outside the page, so hiding always unloads it,
+    // as it does one still waiting on its PlayReady client. A proxied stream
+    // is released too: the TV pauses the element before the app hears it is
+    // hidden, and a paused player keeps fetching through its session.
+    this.wasPlayingBeforeHide = !this.videoEl.paused || this.pipeline.isLunaActive()
+      || this.pipeline.isLunaPending() || this.pipeline.isProxyPending() || this.pipeline.isProxied();
     if (this.wasPlayingBeforeHide) {
       // Save catch-up position and remember it for resume() BEFORE the element is destroyed.
       // Prefer a not-yet-applied resume seek: if we suspend before loadedmetadata
@@ -428,11 +547,44 @@ export class Player {
         );
         this.saveCatchupProgress();
       }
+      // A proxied stream reopens its session on resume, a finite one where it
+      // was, and a paused one paused again.
+      if (this.pipeline.isLunaActive() || this.lunaRestore || this.pipeline.isProxied()) {
+        this.captureLunaResume(this.videoEl, this.currentChannel);
+      }
       this.stallWatchdog.stop();
       this.tracks.suspend();
       this.pipeline.destroy();
       this.recreateVideoEl();
     }
+  }
+
+  private captureResumePoint(el: HTMLVideoElement, channel: Channel): LunaResume & {
+    kind: 'catchup' | 'finite' | 'live';
+  } {
+    const clock = this.pipeline.lunaClock();
+    const at = this.pendingSeekTarget ?? (clock ? clock() : el.currentTime);
+    const kind = this.catchupInfo ? 'catchup' : Number.isFinite(el.duration) ? 'finite' : 'live';
+    // Catch-up keeps its own resume point; a live stream reloads at its edge.
+    let position = kind === 'finite' && Number.isFinite(at) && at > 0 ? at : 0;
+    let paused = this.userPaused && el.paused;
+    // A restore that hasn't landed yet: its seek and pause still stand, and
+    // userPaused is only set once the restore pauses.
+    const restore = this.lunaRestore;
+    if (restore) {
+      if (this.pendingResumeSecs > 0 || position === 0) position = restore.position;
+      paused = paused || restore.paused;
+    }
+    return { channel, position, paused, kind };
+  }
+
+  private captureLunaResume(el: HTMLVideoElement, channel: Channel): void {
+    const { position, paused, kind } = this.captureResumePoint(el, channel);
+    this.lunaRestore = null;
+    this.lunaResume = { channel, position, paused };
+    log.info('Luna playback suspended', 'event=playback.luna.suspend', this.playbackLabel(),
+      `kind=${kind}`, `atS=${secondsBucket(kind === 'catchup' ? this.catchupSuspendPos : position)}`,
+      `paused=${paused ? 1 : 0}`);
   }
 
   /**
@@ -463,6 +615,9 @@ export class Player {
   }
 
   resume(): void {
+    this.hidden = false;
+    const syncOnResume = this.syncOnResume;
+    this.syncOnResume = false;
     if (!this.videoEl) return;
     if (!this.canResumePlayback()) {
       this.stop();
@@ -477,20 +632,30 @@ export class Player {
       return;
     }
     if (!this.currentChannel) return;
-    if (this.wasPlayingBeforeHide) {
-      this.wasPlayingBeforeHide = false;
-      const channel = this.currentChannel;
-      const index = this.currentIndex;
-      const catchup = this.catchupInfo || undefined;
-      const preview = this.livePreviewMode;
-      // Backgrounding relocks parental controls, so a locked channel asks again
-      // in full screen; a preview the user didn't start just stops.
-      if (!this.authorizeLive(channel, () => this.playResolved(channel, index, catchup), preview, !preview)) {
-        log.info('Resume waits for the parental PIN', 'event=parental.playback.relocked',
-          'kind=live', `preview=${String(preview)}`, `catchup=${String(!!catchup)}`);
-        this.stop();
-        if (!preview) this.onBack();
-      }
+    if (!this.wasPlayingBeforeHide) {
+      if (syncOnResume) this.syncCurrentIndex(true);
+      return;
+    }
+    this.wasPlayingBeforeHide = false;
+    const channel = this.currentChannel;
+    const index = this.currentIndex;
+    const catchup = this.catchupInfo || undefined;
+    const preview = this.livePreviewMode;
+    // stop() below drops it; the PIN's play must still restore it.
+    const lunaResume = this.lunaResume;
+    const rebinds = this.rebinds;
+    const play = () => {
+      const latest = this.latestRebind(channel, index, rebinds);
+      if (lunaResume) this.lunaResume = { ...lunaResume, channel: latest.channel };
+      this.playResolved(latest.channel, latest.channelIndex, catchup);
+    };
+    // Backgrounding relocks parental controls, so a locked channel asks again
+    // in full screen; a preview the user didn't start just stops.
+    if (!this.authorizeLive(channel, play, preview, !preview)) {
+      log.info('Resume waits for the parental PIN', 'event=parental.playback.relocked',
+        'kind=live', `preview=${String(preview)}`, `catchup=${String(!!catchup)}`);
+      this.stop();
+      if (!preview) this.onBack();
     }
   }
 
@@ -634,6 +799,14 @@ export class Player {
       this.pendingResumeSecs = catchup?.resumeSecs ?? 0;
     }
     this.pendingSeekTarget = null;
+    // By stream, not object: a playlist rebind while hidden replaces the channel.
+    this.lunaRestore = this.lunaResume
+      && channelStreamIdentity(this.lunaResume.channel) === channelStreamIdentity(channel)
+      ? this.lunaResume : null;
+    this.lunaResume = null;
+    if (this.lunaRestore && this.lunaRestore.position > 0) {
+      this.pendingResumeSecs = this.lunaRestore.position;
+    }
 
     log.info('play index', channelIndex, '|', channel.name, catchup ? '(catchup)' : '');
     this.currentChannel = channel;
@@ -650,18 +823,28 @@ export class Player {
     this.videoEl.muted = this.livePreviewMode && this.previewMuteOverride !== null
       ? this.previewMuteOverride
       : this.liveMuted;
+    this.lunaRestoreMute = null;
+    if (this.lunaRestore?.paused) {
+      // Luna plays a moment before it can pause again; keep that silent.
+      this.lunaRestoreMute = this.videoEl.muted;
+      this.videoEl.muted = true;
+    }
     this.videoEl.volume = this.liveVolume;
     this.catchupCheckpointAt = Date.now(); // reset periodic-save timer for the new session
     this.osd.clearFailedIcons();
-    if (channelIndex >= 0) StorageService.setLastChannel(channelIndex);
-    StorageService.setLastChannelKey(channelKey(channel));
+    StorageService.setLastChannel({
+      index: channelIndex >= 0 ? channelIndex : StorageService.getLastChannel()?.index ?? 0,
+      key: channelKey(channel),
+      stream: channelStreamKey(channel),
+      exact: channelExactStreamKey(channel),
+    });
 
     const url = this.resolveStreamUrl(channel, catchup || null);
     if (catchup) log.debug('catchup URL:', diagnosticStreamUrl(url));
 
     this.videoEl.classList.add('active');
     this.onPlaybackStateChanged();
-    this.loadStream(url, channel.extras);
+    this.loadStream(url, channel.extras, { headers: channelHttpHeaders(channel) });
     this.showOSD();
     if (!this.livePreviewMode) show(this.container);
     this.stallWatchdog.start(isWebOS(), StorageService.getLiveReconnectAttempts());
@@ -728,6 +911,8 @@ export class Player {
     this.currentScope = null;
     this.catchupInfo = null;
     this.vod = v;
+    this.lunaResume = null;
+    this.lunaRestore = null;
     this.pendingResumeSecs = v.resumeSecs > 0 ? v.resumeSecs : 0;
     this.pendingSeekTarget = null;
     this.osd.clearFailedIcons();
@@ -875,6 +1060,7 @@ export class Player {
     this.loadStream(
       this.resolveStreamUrl(this.currentChannel, this.catchupInfo),
       this.currentChannel.extras,
+      { headers: channelHttpHeaders(this.currentChannel), reload: true },
     );
   }
 
@@ -919,6 +1105,8 @@ export class Player {
     this.playbackActive = false;
     this.wasPlayingBeforeHide = false;
     this.userPaused = false;
+    this.lunaResume = null;
+    this.lunaRestore = null;
     this.startPlaybackGeneration();
     this.clearUpNextTimer();
     this.vodTracksLatePending = false;
@@ -941,6 +1129,7 @@ export class Player {
     hide(this.container);
     this.vod = null;
     this.pendingResumeSecs = 0;
+    this.reopenResume = false;
     this.pendingSeekTarget = null;
     this.catchupCheckpointAt = 0;
     this.catchupSuspendPos = -1;
@@ -1007,7 +1196,13 @@ export class Player {
     back?.();
   }
 
-  private loadStream(url: string, extras: Record<string, string> | null, opts?: { direct?: boolean }): void {
+  private loadStream(url: string, extras: Record<string, string> | null, opts?: PipelineLoadOptions): void {
+    if (!opts?.reload) {
+      this.proxyReopened = false;
+      this.channelPlayed = false;
+      this.reopenResume = false;
+    }
+    this.loadPlayed = false;
     this.tracks.resetForLoad();
     this.vodTracksLatePending = false;
     this.manifestVariants = [];
@@ -1015,6 +1210,10 @@ export class Player {
     this.startupPending = true;
     this.startupWatchdog.stop();
     this.pipeline.load(url, extras, opts);
+    // Only the live preview reports a rect; every other entry is full screen,
+    // and a rect left from an earlier preview would shrink the Luna picture.
+    // After load, so the outgoing pipeline is already gone.
+    if (!this.livePreviewMode) this.pipeline.setLunaDisplay('full');
   }
 
   /**
@@ -1033,7 +1232,7 @@ export class Player {
     const source = v?.querySelector('source');
     const declaredType = source?.getAttribute('type') ?? '';
     // A source rejected on its declared type never becomes currentSrc.
-    const url = v?.currentSrc || source?.getAttribute('src') ||
+    const url = this.pipeline.lunaStreamUrl() || elementSrc(v) || source?.getAttribute('src') ||
       this.vod?.url || this.currentChannel?.url || '';
     const deferred = failure === 'timeout' && !this.vod;
     const detail = [
@@ -1050,12 +1249,17 @@ export class Player {
     if (deferred) {
       log.warn('Stream produced no frame', 'event=playback.startup.failed',
         this.playbackLabel(), ...detail);
+      this.escalateStartup();
       return;
     }
     log.error('Stream never started', 'event=playback.startup.failed',
       this.playbackLabel(), ...detail);
+    if (this.escalateStartup()) return;
     this.startupPending = false;
-    this.onError('unsupported');
+    // A live source that already played on this channel failed its reload:
+    // the server is away, not the format, so the reconnect budget applies.
+    const reconnect = this.channelPlayed && this.liveSessionActive && !this.catchupInfo && !this.vod;
+    this.onError(reconnect ? undefined : 'unsupported');
   }
 
   private applyPipelineManifest(manifest: PipelineManifest): void {
@@ -1063,9 +1267,48 @@ export class Player {
     this.tracks.applyManifest(manifest);
   }
 
+  // A channel with HTTP headers that never started moves to the next step
+  // the setting allows: the element, Media service, then the local proxy.
+  private escalateStartup(): boolean {
+    if (!this.startupPending || !this.pipeline.escalate()) return false;
+    this.startupWatchdog.start();
+    if (this.liveSessionActive && !this.catchupInfo && isWebOS()) this.stallWatchdog.resume();
+    return true;
+  }
+
+  private notePlayed(): void {
+    this.loadPlayed = true;
+    this.channelPlayed = true;
+  }
+
+  // A header channel that no step started since the user's load.
+  private chainUnstarted(): boolean {
+    return !this.channelPlayed && this.pipeline.isHeaderChain();
+  }
+
+  // A proxy session the service expired, or lost, fails a stream that had
+  // played: one fresh session resumes it where it was. Xtream VOD plays
+  // direct, never through the proxy.
+  private reopenProxy(): boolean {
+    if (this.startupPending || !this.loadPlayed || this.proxyReopened || this.vod || !this.currentChannel
+        || !this.pipeline.isProxied()) return false;
+    this.proxyReopened = true;
+    const v = this.videoEl;
+    const position = this.pendingSeekTarget ?? v?.currentTime ?? 0;
+    if (position > 0 && (this.catchupInfo || (v && Number.isFinite(v.duration)))) {
+      this.pendingResumeSecs = Math.max(this.pendingResumeSecs, position);
+      this.reopenResume = true;
+    }
+    log.warn('Reopening the local proxy session', 'event=playback.proxy.reopen', this.playbackLabel());
+    this.reloadCurrentStream();
+    return true;
+  }
+
   private onError(reason?: 'unsupported'): void {
     if (!this.playbackActive || this.wasPlayingBeforeHide) return;
     if (this.errorAdvanceTimer !== null) return;
+    if (this.escalateStartup()) return;
+    if (this.reopenProxy()) return;
     if (this.liveSessionActive) {
       this.livePlaybackStatus = 'error';
       this.onPlaybackStateChanged();
@@ -1102,6 +1345,7 @@ export class Player {
         this.loadStream(
           this.resolveStreamUrl(this.currentChannel, this.catchupInfo),
           this.currentChannel.extras,
+          { headers: channelHttpHeaders(this.currentChannel) },
         );
         return;
       }
@@ -1121,7 +1365,8 @@ export class Player {
       v ? this.mediaState(v) : 'no video element',
       v?.error ? { code: v.error.code, message: v.error.message } : 'no error info',
       '| channel:', this.currentChannel?.name,
-      '| url:', diagnosticStreamUrl(v?.currentSrc || this.currentChannel?.url || ''));
+      '| url:', diagnosticStreamUrl(this.pipeline.lunaStreamUrl() || elementSrc(v)
+        || this.currentChannel?.url || ''));
     if (this.liveSessionActive && !this.catchupInfo && reason !== 'unsupported') {
       this.stallWatchdog.pause();
       this.errorRetryPending = true;
@@ -1139,11 +1384,15 @@ export class Player {
     }
     this.stallWatchdog.stop();
     this.markLiveUnavailable('playback_error');
-    this.osd.updateMessage(t('player.streamError'));
+    this.osd.updateMessage(this.streamErrorMessage());
     this.errorAdvanceTimer = setTimeout(() => {
       this.errorAdvanceTimer = null;
       this.channelUp();
     }, 2000);
+  }
+
+  private streamErrorMessage(): string {
+    return t(this.pipeline.headersTurnedOff() ? 'player.streamErrorHeadersOff' : 'player.streamError');
   }
 
   private markLiveUnavailable(reason: string): void {
@@ -1197,6 +1446,23 @@ export class Player {
     }
   }
 
+  /** Where the picture belongs: a preview slot rect, or null for full screen. */
+  setVideoDisplay(rect: Rectangle | null): void {
+    if (!rect) {
+      this.pipeline.setLunaDisplay('full');
+      return;
+    }
+    // setDisplayWindow takes the 1920x1080 app space.
+    const scale = window.innerWidth > 0
+      ? CONFIG.PLAYER.LUNA_MEDIA_DISPLAY_WIDTH / window.innerWidth : 1;
+    this.pipeline.setLunaDisplay({
+      x: rect.left * scale,
+      y: rect.top * scale,
+      width: rect.width * scale,
+      height: rect.height * scale,
+    });
+  }
+
   exitLivePreview(): void {
     if (!this.livePreviewMode) return;
     this.livePreviewMode = false;
@@ -1207,26 +1473,30 @@ export class Player {
     if (!this.liveSessionActive || !this.currentChannel || !this.videoEl || this.vod || this.catchupInfo) return null;
     return {
       channel: this.currentChannel,
-      muted: this.videoEl.muted,
+      muted: this.lunaRestoreMute ?? this.videoEl.muted,
       status: this.livePlaybackStatus,
     };
   }
 
   togglePreviewMute(): void {
     if (!this.livePreviewMode || !this.liveSessionActive || !this.videoEl) return;
-    this.previewMuteOverride = !this.videoEl.muted;
-    this.videoEl.muted = this.previewMuteOverride;
+    this.previewMuteOverride = !(this.lunaRestoreMute ?? this.videoEl.muted);
+    // A restore still silenced until its pause takes the choice when it ends.
+    if (this.lunaRestoreMute !== null) this.lunaRestoreMute = this.previewMuteOverride;
+    else this.videoEl.muted = this.previewMuteOverride;
     this.onPlaybackStateChanged();
   }
 
   private rememberLiveAudio(): void {
     if (!this.videoEl) return;
-    if (this.livePreviewMode) this.previewMuteOverride = !!this.videoEl.muted;
-    else this.liveMuted = !!this.videoEl.muted;
+    const muted = this.lunaRestoreMute ?? !!this.videoEl.muted;
+    if (this.livePreviewMode) this.previewMuteOverride = muted;
+    else this.liveMuted = muted;
     this.liveVolume = Number.isFinite(this.videoEl.volume) ? this.videoEl.volume : 1;
   }
 
   private restoreLiveMute(): void {
+    this.lunaRestoreMute = null;
     this.previewMuteOverride = null;
     if (this.videoEl) this.videoEl.muted = this.liveMuted;
   }
@@ -1559,10 +1829,17 @@ export class Player {
     return this.currentChannel;
   }
 
-  /** Rebind live playback after the channel catalog is rebuilt or reordered. */
-  syncCurrentIndex(): void {
-    if (!this.currentChannel) return;
-    const resolved = PlaylistService.resolveChannelKey(channelKey(this.currentChannel));
+  /** Rebind live playback after the channel catalog is rebuilt or reordered;
+   *  `resumed` replays a rebind deferred while the page was hidden. */
+  syncCurrentIndex(resumed = false): void {
+    const current = this.currentChannel;
+    if (!current) return;
+    const resolved = PlaylistService.resolveChannelKey(
+      channelKey(current),
+      channelStreamIdentity(current),
+      channel => channel.group === current.group,
+      channelExactStreamIdentity(current),
+    );
     if (!resolved) {
       this.currentIndex = -1;
       this.onTvPlaybackChanged(-1, this.catchupInfo ? this.catchupInfo.start * 1000 : null);
@@ -1570,12 +1847,65 @@ export class Player {
       return;
     }
     if (this.liveSessionActive && !this.catchupInfo
-        && this.resolveStreamUrl(this.currentChannel, null)
-          !== this.resolveStreamUrl(resolved.channel, null)) {
-      // Already authorized: a refreshed stream URL must not ask for the PIN.
-      this.playResolved(resolved.channel, resolved.channelIndex);
+        && (this.resolveStreamUrl(current, null)
+          !== this.resolveStreamUrl(resolved.channel, null)
+          || channelStreamIdentity(current)
+            !== channelStreamIdentity(resolved.channel))) {
+      const { channel, channelIndex } = resolved;
+      if (this.wasPlayingBeforeHide) {
+        // Suspended: resume() plays and re-authorizes the rebound channel.
+        if (this.lunaResume) this.lunaResume = { ...this.lunaResume, channel };
+        this.rebinds++;
+        this.currentChannel = channel;
+        this.currentIndex = channelIndex;
+        this.currentIndexAnchor = channelIndex;
+        this.onTvPlaybackChanged(channelIndex, null);
+        this.onPlaybackStateChanged();
+        return;
+      }
+      if (this.hidden) {
+        // Hidden with the page's player kept: reload once visible, never here.
+        this.syncOnResume = true;
+        return;
+      }
+      const preview = this.livePreviewMode;
+      // The reload keeps the user's pause and position, even when it lands
+      // after resume() already restarted the stream.
+      const point = this.videoEl ? this.captureResumePoint(this.videoEl, channel) : null;
+      const rebinds = this.rebinds;
+      const play = () => {
+        const latest = this.latestRebind(channel, channelIndex, rebinds);
+        if (point && (point.paused || point.position > 0)) {
+          this.lunaResume = { channel: latest.channel, position: point.position, paused: point.paused };
+        }
+        this.playResolved(latest.channel, latest.channelIndex);
+      };
+      if (resumed) {
+        // Backgrounding relocked parental controls, as resume() honors.
+        if (!this.authorizeLive(channel, play, preview, !preview)) {
+          log.info('Rebound channel waits for the parental PIN', 'event=parental.playback.relocked',
+            'kind=live', `preview=${String(preview)}`, 'catchup=false', 'reason=resume');
+          this.stop();
+          if (!preview) this.onBack();
+        }
+        return;
+      }
+      // Already authorized: a refreshed stream must not ask for the PIN. A
+      // stand-in under other parental groups that locks it must.
+      if (sameParentalScope(current, channel)
+          || ParentalControlService.decision(liveParentalRequest(channel)).allowed) {
+        play();
+        return;
+      }
+      if (!this.authorizeLive(channel, play, preview, !preview)) {
+        log.info('Rebound channel waits for the parental PIN', 'event=parental.playback.relocked',
+          'kind=live', `preview=${String(preview)}`, 'catchup=false', 'reason=rebind');
+        this.stop();
+        if (!preview) this.onBack();
+      }
       return;
     }
+    this.rebinds++;
     this.currentChannel = resolved.channel;
     this.currentIndex = resolved.channelIndex;
     this.currentIndexAnchor = resolved.channelIndex;
@@ -1584,6 +1914,22 @@ export class Player {
       this.catchupInfo ? this.catchupInfo.start * 1000 : null,
     );
     this.onPlaybackStateChanged();
+  }
+
+  // A play deferred behind the PIN: a refresh meanwhile may have rebound the
+  // stream to a fresh copy, whose token the stale one no longer carries.
+  private latestRebind(
+    channel: Channel,
+    channelIndex: number,
+    rebinds: number,
+  ): { channel: Channel; channelIndex: number } {
+    const current = this.currentChannel;
+    if (rebinds === this.rebinds || !current
+        || channelStreamIdentity(current) !== channelStreamIdentity(channel)
+        || !sameParentalScope(current, channel)) {
+      return { channel, channelIndex };
+    }
+    return { channel: current, channelIndex: this.currentIndex };
   }
 
   getAudioTracks(): AudioTrackOption[] {
@@ -1608,6 +1954,8 @@ export class Player {
       // The Up Next countdown sets the queued vod before its media loads.
       available: this.playbackActive && this.vod !== null &&
         !STREAMING_MIMES.has(streamUrlMime(this.vod.url)) &&
+        // The rate would reach the placeholder clip, not the Luna stream.
+        !this.pipeline.isLunaActive() &&
         !this.playbackRate.isRejected(),
       rate: this.playbackRate.currentRate(),
     };
@@ -1731,6 +2079,22 @@ export class Player {
     // plain global stepping, not whatever view was active before this jump.
     this.play(index, undefined, null);
   }
+}
+
+// A restored Luna element keeps the placeholder as currentSrc until its next
+// resource selection; it is never the stream that failed.
+function elementSrc(video: HTMLVideoElement | null): string {
+  const src = video?.currentSrc || '';
+  return src.indexOf(CONFIG.PLAYER.LUNA_MEDIA_PLACEHOLDER) < 0 ? src : '';
+}
+
+// Same channel key and the same groups: what the PIN unlocked still covers it.
+function sameParentalScope(a: Channel, b: Channel): boolean {
+  const scope = (channel: Channel) => {
+    const request = liveParentalRequest(channel);
+    return [request.target, ...request.parents].map(parentalTargetKey).sort().join('\n');
+  };
+  return scope(a) === scope(b);
 }
 
 function sameParentalItem(a: VodQueueItem, b: VodQueueItem): boolean {
