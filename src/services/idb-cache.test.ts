@@ -117,6 +117,18 @@ describe('idb-cache', () => {
     const MiB = 1024 * 1024;
     const bigChannel = (bytes: number): Channel => ({ ...channel('ch1'), name: 'x'.repeat(bytes) });
 
+    it('keeps a channel list and both search catalogs in a 48 MB quota', async () => {
+      // webOS 5: the reported usage still counts records deleted before it.
+      stubNavigator('storage', { estimate: async () => ({ usage: 40 * MiB, quota: 48 * MiB }) });
+      await setCachedPlaylist([bigChannel(20 * MiB)]);
+      await setCachedCatalog('x1|vod_all-v3', ['x'.repeat(20 * MiB)]);
+      await setCachedCatalog('x1|series_all-v3', ['x'.repeat(5 * MiB)]);
+
+      expect(await getCachedPlaylist(null)).not.toBeNull();
+      expect(await getCachedCatalog('x1|vod_all-v3')).not.toBeNull();
+      expect(await getCachedCatalog('x1|series_all-v3')).not.toBeNull();
+    });
+
     it('takes only the quota from webkitTemporaryStorage', async () => {
       usePrefixedQuota((success) => success(1234, EMULATOR_QUOTA));
 
@@ -372,7 +384,8 @@ describe('idb-cache', () => {
 
   it('includes stream MIME records in the shared cache eviction pass', async () => {
     await setCachedStreamMime('http://host/live', 'video/mp2t');
-    await withQuota(100, 0, async () => {
+    // A budget the new record fits alone, but not beside the MIME record.
+    await withQuota((await getCacheUsage()).total.bytes + 1, 0, async () => {
       await setCachedCatalog('x1|vod_categories', ['a']);
     });
 
@@ -674,7 +687,7 @@ describe('idb-cache', () => {
       const used = (await getCacheUsage()).total.bytes;
       Object.defineProperty(navigator, 'storage', {
         configurable: true,
-        value: { estimate: async () => ({ usage: 0, quota: 2 * (used - 1024 * 1024) }) },
+        value: { estimate: async () => ({ usage: 0, quota: used - 1024 * 1024 }) },
       });
       clock.mockReturnValue(initial + 8 * hour);
       await setCachedCatalog('x1|vod_categories', [{ id: '1', name: 'Cat A' }]);
@@ -891,7 +904,7 @@ describe('idb-cache', () => {
     expect(usage.categories.epg.entries).toBe(1);
     expect(usage.categories.catalog.entries).toBe(1);
     expect(usage.categories.subtitle.entries).toBe(1);
-    expect(usage.budgetBytes).toBe(384 * 1024 * 1024);
+    expect(usage.budgetBytes).toBe(768 * 1024 * 1024);
 
     await clearAllCachedData();
     expect((await getCacheUsage()).total).toEqual({ bytes: 0, entries: 0 });
@@ -1081,16 +1094,14 @@ ${'x'.repeat(1024)}`);
     });
 
     it('skips an index larger than its share of the room left', async () => {
-      // The 384 MiB budget: 10% is 38.4 MiB.
+      // The index room is 80% of the 768 MiB quota: 10% of it is 61.4 MiB.
       const info = vi.spyOn(console, 'log').mockImplementation(() => undefined);
-      expect(await reserveSearchIndex(candidate('x1|vod_all', 39 * MiB))).toBeNull();
+      expect(await reserveSearchIndex(candidate('x1|vod_all', 77 * MiB))).toBeNull();
       expect(info.mock.calls.map(call => call.join(' '))).toContainEqual(expect.stringContaining(
-        `event=search.index.persist.skipped reason=budget bytes=${String(39 * MiB)} roomBytes=${String(384 * MiB - sourceBytes)}`,
+        `event=search.index.persist.skipped reason=budget bytes=${String(77 * MiB)} roomBytes=${String(Math.floor(768 * MiB * 0.8))}`,
       ));
       info.mockRestore();
-      expect(await reserveSearchIndex(candidate('x1|vod_all', 38 * MiB))).not.toBeNull();
-      // Reserved bytes shrink the room for the next index.
-      expect(await reserveSearchIndex(candidate('x1|series_all', 35 * MiB))).toBeNull();
+      expect(await reserveSearchIndex(candidate('x1|vod_all', 60 * MiB))).not.toBeNull();
       expect((await getCacheUsage()).categories.search.entries).toBe(1);
     });
 
@@ -1115,7 +1126,7 @@ ${'x'.repeat(1024)}`);
 
       // The older index is gone even when the new one does not fit.
       const info = vi.spyOn(console, 'log').mockImplementation(() => undefined);
-      expect(await reserveSearchIndex(candidate('x1|vod_all', 39 * MiB, 2))).toBeNull();
+      expect(await reserveSearchIndex(candidate('x1|vod_all', 77 * MiB, 2))).toBeNull();
       expect(info.mock.calls.map(call => call.join(' '))).toContainEqual(expect.stringMatching(
         /event=search\.index\.persist\.skipped reason=budget bytes=\d+ roomBytes=\d+ evicted=1$/,
       ));
@@ -1131,9 +1142,9 @@ ${'x'.repeat(1024)}`);
       await setCachedSubtitle('subdl:1', 'WEBVTT\n\nkept');
       const used = (await getCacheUsage()).total.bytes;
 
-      // A budget (half the quota) that fits everything but the index, with
+      // A budget (the whole quota) that fits everything but the index, with
       // room for the pruning margin.
-      await withQuota(2 * (used - 2 * MiB), 0, async () => {
+      await withQuota(used - 2 * MiB, 0, async () => {
         await setCachedCatalog('x1|vod_categories', ['a']);
       });
 

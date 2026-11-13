@@ -23,7 +23,10 @@ import { cacheEntryMetaId, cacheRecordTimestamp, PLAYLIST_CACHE_KEY } from './id
 const log = createLogger('CacheStorage');
 const CACHE_CATEGORIES = ['playlist', 'epg', 'catalog', 'subtitle', 'health', 'search'] as const;
 const MAX_BUDGET_BYTES = 1024 * 1024 * 1024;
-const STANDARD_QUOTA_SHARE = 0.5;
+// Record sizes are measured as JSON, about a third more than the engine
+// stores, so the whole quota still leaves the engine room. A 48 MB webOS 5
+// quota at half could not hold a large channel list and both search catalogs.
+const STANDARD_QUOTA_SHARE = 1;
 // The prefixed API reports no usage, so nothing checks the origin before a
 // write. On the webOS 4 emulator writes failed at about 60% of its quota, and
 // personal records need the rest.
@@ -1015,13 +1018,11 @@ async function ensureCapacity(deltaBytes: number): Promise<void> {
   // Without a quota, the engine's quota error is the only guard.
   if (budgetBytes === null || estimate.quota === null) return;
   // A record the budget can't hold even alone would only flush the rest.
-  const cacheOver = deltaBytes <= budgetBytes
+  // The origin's usage lags a deletion until the engine compacts, so it would
+  // evict a catalog for space already freed; the engine's quota error guards it.
+  const required = deltaBytes <= budgetBytes
     ? metadata.total.bytes + deltaBytes - budgetBytes
     : 0;
-  const originOver = estimate.usage !== null
-    ? estimate.usage + deltaBytes - Math.floor(estimate.quota * 0.8)
-    : 0;
-  const required = Math.max(cacheOver, originOver);
   if (required > 0) {
     log.info(
       'Cache budget exceeded; pruning',

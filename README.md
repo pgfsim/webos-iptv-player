@@ -48,17 +48,23 @@ account blocked (HTTP 403). In this fork:
   the catalogs download in the background. By the time you open Search it
   is usually instant. Search and the preload share one download, and closing
   Search does not cancel it.
-- **Kept in memory until the refresh interval.** The catalogs stay in memory
-  for the session until the **Xtream content catalog refresh interval** in Settings expires. The
-  catalogs (about 21 MB of movies and 5 MB of series on the test panel) are
-  too large for the TV's browser storage, so they are downloaded again on
-  the next launch.
+- **Kept until the refresh interval.** The catalogs stay in memory for the
+  session, and saved in the TV's browser storage across restarts, until the
+  **Xtream content catalog refresh interval** in Settings expires. On the
+  test panel that is about 20 MB of movies and 5 MB of series.
 - **Results appear early.** Queries run as soon as channels are indexed.
   Programs, movies and series join the results as each one arrives.
-- **The channel list is never evicted.** When storage is full, saving
-  catalogs or other caches no longer evicts the saved channel list. The
-  other write is skipped instead, so starting the app never re-downloads the
-  playlist because of Search.
+- **Storage sized for a 48 MB quota.** The original budgets half the quota,
+  which cannot hold a 20 MB channel list and both catalogs, so each launch
+  downloaded one again. This fork budgets the whole quota (record sizes are
+  measured as JSON, about a third more than the engine stores) and ignores
+  the origin's reported usage, which still counts deleted records until the
+  engine compacts. The engine's own quota error remains the hard limit.
+- **The channel list is never evicted.** When the engine refuses a write,
+  the app frees everything but the live channel list and retries, so
+  starting the app never re-downloads the playlist because of Search. A
+  channel list left under an older cache key is deleted, since nothing
+  reads it again.
 
 Measured on the NANO866NA with a large panel and the guide off:
 
