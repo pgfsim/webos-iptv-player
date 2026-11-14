@@ -1,13 +1,28 @@
 import type {
   Channel,
-  EpgChannel,
   ParsedEpg,
   ParsedPlaylist,
-  Programme,
+  SeriesItem,
+  VodItem,
 } from '../types';
+import type { CatalogConcealment } from '../utils/catalog-concealment';
 import type { XMLTVParseStats } from '../parsers/xmltv-parser';
 import type { XtreamLiveReference } from '../utils/xtream-live-match';
 import type { XtreamGroupNameFilter } from '../utils/xtream-category-filter';
+import type { XtreamCredentials, XtreamLiveOutput } from '../utils/xtream-url';
+import type {
+  XtreamClockFailure,
+  XtreamLiveStreamsRequest,
+  XtreamLiveStreamsResponse,
+  XtreamServerClock,
+} from '../services/xtream-client';
+import type {
+  XtreamCatalogStreamChunk,
+  XtreamCatalogStreamRequest,
+  XtreamCatalogStreamResponse,
+} from '../services/xtream-catalog-stream';
+import type { HeldWriteResult } from '../services/held-records';
+import type { HeldValueWriteRequest } from './held-values';
 
 export interface M3UWorkerRequest {
   url: string;
@@ -15,6 +30,33 @@ export interface M3UWorkerRequest {
   xtreamLive?: XtreamLiveReference[];
   xtreamBaseUrl?: string;
   xtreamGroupFilter?: XtreamGroupNameFilter;
+  /** De-duplicate streams in the worker and stamp each channel with it. */
+  playlistId?: string;
+  /** Keep the channels in the worker so it can write the playlist cache. */
+  holdChannels?: boolean;
+  /** Stamp catch-up on channels of archived `xtreamLive` streams. */
+  xtreamCatchup?: XtreamCatchupRequest;
+}
+
+export interface XtreamCatchupRequest {
+  accountId: string;
+  credentials: XtreamCredentials;
+  output: XtreamLiveOutput;
+  /** The whole Live catalog's counts, before any category filter, for the log. */
+  catalogStreams?: number;
+  catalogArchived?: number;
+}
+
+export interface XtreamCatchupCounts {
+  streams: number;
+  archived: number;
+  enabled: number;
+  unmatched: number;
+  /** `late`: the clock missed the stamping but arrived before the load ended. */
+  clock: 'ok' | 'late' | 'missing';
+  lateClock?: XtreamServerClock;
+  /** Why a needed clock is missing; `wait` when it never answered in time. */
+  clockFailure?: XtreamClockFailure | 'wait';
 }
 
 export interface M3UWorkerResponse {
@@ -26,8 +68,14 @@ export interface M3UWorkerResponse {
     chunks: number;
     channelsKept: number;
     channelsDropped: number;
+    /** Set when the worker de-duplicated the playlist by stream. */
+    duplicates?: number;
+    /** Set when the worker stamped Xtream catch-up on the channels. */
+    catchup?: XtreamCatchupCounts;
     elapsedMs: number;
   };
+  /** The worker kept every channel it sent, chunks first, for the cache write. */
+  held?: { token: string };
 }
 
 export type M3UWorkerChunk =
@@ -35,6 +83,8 @@ export type M3UWorkerChunk =
       kind: 'channels';
       channels: Channel[];
       inputBytes: number;
+      /** The response's decoded size, when its headers reveal it. */
+      totalBytes?: number;
       chunks: number;
       channelsEmitted: number;
       channelsDropped: number;
@@ -42,6 +92,7 @@ export type M3UWorkerChunk =
   | {
       kind: 'progress';
       inputBytes: number;
+      totalBytes?: number;
       chunks: number;
       channelsEmitted: number;
       channelsDropped: number;
@@ -57,11 +108,15 @@ export interface XMLTVWorkerRequest {
     retainChannelCatalog?: boolean;
     maxProgrammes?: number;
   };
+  /** Keep the parsed guide so its cache write can run in the worker. */
+  holdForCache?: boolean;
 }
 
 export interface XMLTVWorkerResponse {
   data: ParsedEpg;
   stats: XMLTVParseStats;
+  /** Only for a complete guide with programmes, the one the page caches. */
+  held?: { token: string };
   metrics: {
     transport: 'stream' | 'array_buffer';
     encoding: 'gzip' | 'plain';
@@ -73,9 +128,7 @@ export interface XMLTVWorkerResponse {
 }
 
 export type XMLTVWorkerChunk =
-  | { kind: 'reset'; attempt: number }
-  | { kind: 'channels'; attempt: number; entries: Array<[string, EpgChannel]> }
-  | { kind: 'programmes'; attempt: number; entries: Array<[string, Programme[]]> }
+  | { kind: 'guide'; part: 'channels' | 'programmes'; blocks: string[] }
   | {
       kind: 'progress';
       attempt: number;
@@ -133,6 +186,27 @@ export interface SearchCachedNames {
 }
 
 /**
+ * A whole catalog the worker reads, filters, and keeps, so the page holds
+ * none of it: query answers carry the ranked items themselves.
+ */
+/** The categories of the few catalog items that have parental rules. */
+export interface CatalogMembersRequest {
+  record: SearchCacheRecord;
+  idField: 'streamId' | 'seriesId';
+  ids: string[];
+}
+
+/** [itemId, categoryId] for each requested id in the record; null: unreadable. */
+export interface CatalogMembersResponse {
+  members: Array<[string, string]>;
+}
+
+export interface SearchCatalogRecord {
+  record: SearchCacheRecord;
+  concealment: CatalogConcealment | null;
+}
+
+/**
  * One slice of a source posted from the main thread. The worker stages slices
  * in order and swaps the source in once `total` documents have arrived.
  */
@@ -154,6 +228,8 @@ export interface SearchIndexRequest {
   cachedProgrammes?: SearchCachedProgrammes;
   cachedMovies?: SearchCachedNames;
   cachedSeries?: SearchCachedNames;
+  catalogMovies?: SearchCatalogRecord;
+  catalogSeries?: SearchCatalogRecord;
 }
 
 export interface SearchIndexUnresolved {
@@ -217,6 +293,16 @@ export interface SearchQueryRequest {
   query: string;
   limit: number;
   includeCatalog: boolean;
+  // False while the page still builds its program list.
+  includeProgrammes?: boolean;
+  /** The catalog items the page kept from earlier answers. */
+  delivered?: SearchDeliveredCount;
+}
+
+export interface SearchDeliveredCount {
+  epoch: number;
+  movies: number;
+  series: number;
 }
 
 export interface SearchRankedIndices {
@@ -224,11 +310,22 @@ export interface SearchRankedIndices {
   hasMore: boolean;
 }
 
+/**
+ * Catalog record items the page lacks for this answer's indices. A new epoch
+ * means the page drops every item it kept before merging these.
+ */
+export interface SearchDeliveredItems {
+  epoch: number;
+  movies: Array<[number, VodItem]>;
+  series: Array<[number, SeriesItem]>;
+}
+
 export interface SearchQueryResponse {
   channels: SearchRankedIndices;
   programmes: SearchRankedIndices;
   movies: SearchRankedIndices;
   series: SearchRankedIndices;
+  items?: SearchDeliveredItems;
 }
 
 export interface ListSearchIndexRequest {
@@ -281,9 +378,43 @@ export interface AppWorkerTasks {
     response: XMLTVWorkerResponse;
     chunk: XMLTVWorkerChunk;
   };
+  'xtream.live-streams': {
+    request: XtreamLiveStreamsRequest;
+    response: XtreamLiveStreamsResponse;
+  };
+  'xtream.catalog-stream': {
+    request: XtreamCatalogStreamRequest;
+    response: XtreamCatalogStreamResponse;
+    chunk: XtreamCatalogStreamChunk;
+  };
+  'xtream.catalog-stream.cancel': {
+    request: { token: string };
+    response: void;
+  };
+  'cache.write-held': {
+    request: HeldValueWriteRequest;
+    response: HeldWriteResult;
+  };
+  'cache.measure-held': {
+    request: { token: string };
+    response: number | null;
+  };
+  // TODO(cleanup, post-1.18.0): remove with migrateLegacyPlaylistCache.
+  'cache.migrate-playlist': {
+    request: { key: string; keyPath: string; timeoutMs: number };
+    response: number | null;
+  };
+  'cache.release-held': {
+    request: { token: string };
+    response: void;
+  };
   'search.index': {
     request: SearchIndexRequest;
     response: SearchIndexResponse;
+  };
+  'catalog.members': {
+    request: CatalogMembersRequest;
+    response: CatalogMembersResponse | null;
   };
   'search.query': {
     request: SearchQueryRequest;

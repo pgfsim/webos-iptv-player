@@ -1,5 +1,3 @@
-import type { CDPSession, Page } from '@playwright/test';
-
 export interface BenchmarkFixtureOptions {
   scale: number;
   accountId: string;
@@ -45,6 +43,18 @@ export function buildM3UFixture(scale: number): string;
 export function installColdLoadFixture(
   options: ColdLoadFixtureOptions,
 ): { playlists: number };
+
+export function waitForPlaylistLoaded(options?: { timeoutMs?: number }): Promise<void>;
+
+export interface StartupSettle {
+  settledMs: number;
+  maxLongTaskMs: number | null;
+  longTaskTotalMs: number | null;
+}
+
+export function waitForStartupSettled(
+  options?: { quietMs?: number; timeoutMs?: number },
+): Promise<StartupSettle>;
 
 export interface StartupHoverBenchmark {
   hoverFrameMs: number;
@@ -200,97 +210,6 @@ export function startTvRendererRssSampler(
   rendererHighWaterMiB: number;
 } | null>>;
 
-export const LARGE_PLAYLIST_CATEGORIES: number;
-
-export interface LargePlaylistCategoryFilter {
-  mode: 'include' | 'exclude';
-  ids: string[];
-}
-
-export function largePlaylistCategoryFilter(): LargePlaylistCategoryFilter;
-
-export function largePlaylistFilteredChannels(
-  liveEntries: number,
-  filter: LargePlaylistCategoryFilter,
-): number;
-
-export interface LargePlaylistBenchmarkOptions {
-  totalEntries: number;
-  liveEntries: number;
-  playlistBytes: number;
-  sampleIntervalMs: number;
-  chunkBytes: number;
-  chunkDelayMs: number;
-  accountId: string;
-  expectedChannels?: number;
-  liveCategories?: LargePlaylistCategoryFilter;
-  timeoutMs: number;
-  deviceIp?: string;
-  advertisedHost?: string;
-  port?: number;
-}
-
-export interface LargePlaylistBenchmarkIo {
-  page: Page;
-  browserCdp: CDPSession;
-  pageCdp: CDPSession;
-  collectGarbage: () => Promise<unknown>;
-  delay: (milliseconds: number) => Promise<void>;
-}
-
-export interface LargePlaylistMemoryBenchmark {
-  totalEntries: number;
-  liveEntries: number;
-  keptCategories: number;
-  playlistBytes: number;
-  playlistMiB: number;
-  catalogBytes: number;
-  catalogMiB: number;
-  chunkBytes: number;
-  chunkDelayMs: number;
-  playlistDurationMs: number;
-  readyMs: number;
-  channels: number;
-  samples: number;
-  baselineRendererProcesses: number;
-  peakRendererProcesses: number;
-  baselineRssMiB: number;
-  peakRssMiB: number;
-  peakRssDeltaMiB: number;
-  retainedRssMiB: number;
-  retainedRssDeltaMiB: number;
-  baselineHeapMiB: number;
-  peakHeapMiB: number;
-  peakHeapDeltaMiB: number;
-  retainedHeapMiB: number;
-  retainedHeapDeltaMiB: number;
-}
-
-export function measureLargePlaylistMemory(
-  options: LargePlaylistBenchmarkOptions,
-  io: LargePlaylistBenchmarkIo,
-): Promise<LargePlaylistMemoryBenchmark>;
-
-export function startLargePlaylistBenchmarkServer(
-  options: LargePlaylistBenchmarkOptions,
-): Promise<{
-  origin: string;
-  stats: {
-    catalogBytes: number;
-    playlistDurationMs: number;
-  };
-  close: () => Promise<void>;
-}>;
-
-export function installLargePlaylistSource(playlist: unknown): void;
-
-export function waitForLargePlaylistChannelCount(options: {
-  expected: number;
-  timeoutMs: number;
-}): Promise<void>;
-
-export function readLargePlaylistChannelCount(): number;
-
 export function releaseXMLTVPipelineBenchmark(): void;
 
 export interface XMLTVCatalogPass {
@@ -337,8 +256,14 @@ export function runM3USearchBenchmark(
   options: { querySamples: number },
 ): Promise<Record<string, any>>;
 
+export interface BenchmarkAssertOptions {
+  /** Warn instead of failing on the known TV-only deviations. */
+  tvQuirks?: boolean;
+}
+
 export function assertM3USearchBenchmark(
   report: Record<string, any>,
+  options?: BenchmarkAssertOptions,
 ): void;
 
 export function runGroupBenchmark(
@@ -368,6 +293,7 @@ export function assertGroupBenchmarkScale(
 export function assertBenchmarkScale(
   report: BenchmarkSuites,
   scale: number,
+  options?: BenchmarkAssertOptions,
 ): void;
 
 export function assertColdLoadBenchmark(

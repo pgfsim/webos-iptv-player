@@ -1,25 +1,29 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
 const { fetchTextMock } = vi.hoisted(() => ({ fetchTextMock: vi.fn() }));
 vi.mock('../utils/fetch-helper', async (importOriginal) => ({
   ...await importOriginal<typeof import('../utils/fetch-helper')>(),
   fetchLimitedText: fetchTextMock,
-  fetchLimitedTextStream: async (
-    url: string,
-    maxBytes: number,
-    timeout: number,
-    signal: AbortSignal | undefined,
-    onText: (text: string) => void,
-  ) => {
-    onText(await fetchTextMock(url, maxBytes, timeout, signal));
+}));
+
+const { runWorkerTaskMock, retained } = vi.hoisted(() => ({ runWorkerTaskMock: vi.fn(), retained: { count: 0 } }));
+vi.mock('../workers/app-worker-client', () => ({
+  appWorkerGeneration: () => 1,
+  runAppWorkerTask: runWorkerTaskMock,
+  retainAppWorker: () => {
+    retained.count++;
+    let held = true;
+    return () => {
+      if (held) retained.count--;
+      held = false;
+    };
   },
 }));
 
 import { FetchTextError } from '../utils/fetch-helper';
 import { CONFIG } from '../config';
-import { createXtreamClient } from './xtream-client';
-import { CatalogTable } from './catalog-table';
-import type { SeriesItem, VodItem } from '../types';
+import { createXtreamClient, loadLiveStreamsCatalog } from './xtream-client';
+import { heldRecord, releaseHeldRecord } from './held-records';
 
 const creds = { baseUrl: 'http://host:8080', username: 'u1', password: 'p1' };
 
@@ -226,6 +230,199 @@ describe('XtreamClient live archive metadata', () => {
       available: false,
       streams: [],
     });
+  });
+});
+
+describe('Xtream Live catalog in the app worker', () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('parses the catalog off the UI thread when a worker is available', async () => {
+    vi.stubGlobal('Worker', class {});
+    runWorkerTaskMock.mockResolvedValueOnce({ available: true, streams: [] });
+    expect(await createXtreamClient(creds).getLiveStreamsResult()).toEqual({
+      available: true,
+      streams: [],
+    });
+    expect(runWorkerTaskMock).toHaveBeenCalledWith('xtream.live-streams', expect.objectContaining({
+      url: expect.stringContaining('action=get_live_streams'),
+    }));
+    expect(fetchTextMock).not.toHaveBeenCalled();
+  });
+
+  it('falls back to this thread when the worker fails', async () => {
+    vi.stubGlobal('Worker', class {});
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    runWorkerTaskMock.mockRejectedValueOnce(new Error('worker crashed'));
+    fetchTextMock.mockResolvedValueOnce('[{"stream_id":1,"name":"ch1"}]');
+    const result = await createXtreamClient(creds).getLiveStreamsResult();
+    expect(result.available).toBe(true);
+    expect(result.streams).toHaveLength(1);
+    expect(fetchTextMock).toHaveBeenCalledTimes(1);
+    expect(warn).toHaveBeenCalledWith(
+      '[Xtream]',
+      'Xtream live catalog worker failed',
+      'event=xtream.live_catalog.worker_failed',
+      expect.any(Error),
+    );
+    warn.mockRestore();
+  });
+
+  it('keeps a request failure the worker reports without refetching', async () => {
+    vi.stubGlobal('Worker', class {});
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    runWorkerTaskMock.mockResolvedValueOnce({ available: false, streams: [], failure: 'invalid_json' });
+    expect(await createXtreamClient(creds).getLiveStreamsResult())
+      .toEqual({ available: false, streams: [] });
+    expect(fetchTextMock).not.toHaveBeenCalled();
+    warn.mockRestore();
+  });
+
+  it('returns a failure code instead of throwing in the worker', async () => {
+    const request = { url: 'http://host/a', timeout: 1000, maxBytes: 1000 };
+    fetchTextMock.mockResolvedValueOnce('<html>nope</html>');
+    expect(await loadLiveStreamsCatalog(request))
+      .toEqual({ available: false, streams: [], failure: 'invalid_json' });
+    fetchTextMock.mockResolvedValueOnce('[{"stream_id":1,"name":"ch1"}]');
+    const loaded = await loadLiveStreamsCatalog(request);
+    expect(loaded.available).toBe(true);
+    expect(loaded.streams).toHaveLength(1);
+    expect(loaded.failure).toBeUndefined();
+  });
+});
+
+describe('whole Xtream catalog in the app worker', () => {
+  const item = { accountId: 'x1', streamId: '1', categoryId: '1' };
+  function holdStream() {
+    let finish: (response: object) => void = () => {};
+    runWorkerTaskMock.mockImplementation((task: string, _payload: unknown, onChunk?: (chunk: object) => void) => {
+      if (task !== 'xtream.catalog-stream') return Promise.resolve();
+      return new Promise((resolve) => {
+        finish = (response) => {
+          onChunk?.({ kind: 'vod', items: [item] });
+          resolve(response);
+        };
+      });
+    });
+    return {
+      finish: () => finish({ items: 1, inputBytes: 1, elapsedMs: 1, held: { token: 'h1', bytes: 10 } }),
+    };
+  }
+  const tasks = () => runWorkerTaskMock.mock.calls.map(call => call[0] as string);
+
+  it('shares one load between callers asking at once', async () => {
+    const stream = holdStream();
+    const client = createXtreamClient(creds);
+    const first = client.getAllVodStreams(['1']);
+    const second = client.getAllVodStreams(['1']);
+    stream.finish();
+    const list = await first;
+    expect(list).toEqual([item]);
+    expect(await second).toBe(list);
+    expect(heldRecord(list)?.bytes).toBe(10);
+    expect(tasks()).toEqual(['xtream.catalog-stream']);
+  });
+
+  it('keeps the worker running while it holds a list for the page', async () => {
+    vi.useFakeTimers();
+    try {
+      const base = retained.count;
+      const client = createXtreamClient(creds);
+      let stream = holdStream();
+      let load = client.getAllVodStreams(['1']);
+      stream.finish();
+      const cached = await load;
+      expect(retained.count).toBe(base + 1);
+      releaseHeldRecord(cached);
+      expect(retained.count).toBe(base);
+
+      stream = holdStream();
+      load = client.getAllVodStreams(['2']);
+      stream.finish();
+      const forgotten = await load;
+      expect(retained.count).toBe(base + 1);
+      vi.advanceTimersByTime(CONFIG.XTREAM.HELD_LIST_MS);
+      expect(retained.count).toBe(base);
+      expect(heldRecord(forgotten)).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('releases the list a load held when every caller canceled it first', async () => {
+    const stream = holdStream();
+    const a = new AbortController();
+    const load = createXtreamClient(creds).getAllVodStreams(['1'], a.signal);
+    a.abort();
+    await expect(load).rejects.toMatchObject({ code: 'cancelled' });
+    stream.finish();
+    await vi.waitFor(() => expect(runWorkerTaskMock).toHaveBeenLastCalledWith('cache.release-held', { token: 'h1' }));
+  });
+
+  it('cancels the worker load once every caller has aborted', async () => {
+    holdStream();
+    const client = createXtreamClient(creds);
+    const a = new AbortController();
+    const b = new AbortController();
+    const first = client.getAllVodStreams(['1'], a.signal);
+    const second = client.getAllVodStreams(['1'], b.signal);
+    a.abort();
+    await expect(first).rejects.toMatchObject({ code: 'cancelled' });
+    expect(tasks()).toEqual(['xtream.catalog-stream']);
+    b.abort();
+    await expect(second).rejects.toMatchObject({ code: 'cancelled' });
+    const token = (runWorkerTaskMock.mock.calls[0][1] as { token: string }).token;
+    expect(runWorkerTaskMock).toHaveBeenLastCalledWith('xtream.catalog-stream.cancel', { token });
+  });
+
+  it('downloads one whole catalog at a time', async () => {
+    const finishes: Array<() => void> = [];
+    runWorkerTaskMock.mockImplementation((task: string, _payload: unknown, onChunk?: (chunk: object) => void) => {
+      if (task !== 'xtream.catalog-stream') return Promise.resolve();
+      return new Promise((resolve) => {
+        finishes.push(() => {
+          onChunk?.({ kind: 'vod', items: [item] });
+          resolve({ items: 1, inputBytes: 1, elapsedMs: 1 });
+        });
+      });
+    });
+    const client = createXtreamClient(creds);
+    const movies = client.getAllVodStreams(['1']);
+    const series = client.getAllSeries(['1']);
+    await Promise.resolve();
+    expect(tasks()).toEqual(['xtream.catalog-stream']);
+    finishes[0]();
+    await movies;
+    await vi.waitFor(() => expect(tasks()).toEqual(['xtream.catalog-stream', 'xtream.catalog-stream']));
+    finishes[1]();
+    await series;
+  });
+
+  it('never starts a queued catalog that every caller left', async () => {
+    holdStream();
+    const client = createXtreamClient(creds);
+    const first = new AbortController();
+    const movies = client.getAllVodStreams(['1'], first.signal);
+    const left = new AbortController();
+    const series = client.getAllSeries(['1'], left.signal);
+    left.abort();
+    await expect(series).rejects.toMatchObject({ code: 'cancelled' });
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(tasks().filter(task => task === 'xtream.catalog-stream')).toHaveLength(1);
+    first.abort();
+    await expect(movies).rejects.toMatchObject({ code: 'cancelled' });
+  });
+
+  it('starts a new load after a canceled one', async () => {
+    const stream = holdStream();
+    const client = createXtreamClient(creds);
+    const a = new AbortController();
+    const first = client.getAllVodStreams(['1'], a.signal);
+    a.abort();
+    await expect(first).rejects.toMatchObject({ code: 'cancelled' });
+    const second = client.getAllVodStreams(['1']);
+    stream.finish();
+    expect(await second).toEqual([item]);
+    expect(tasks().filter(task => task === 'xtream.catalog-stream')).toHaveLength(2);
   });
 });
 
@@ -473,55 +670,6 @@ describe('XtreamClient VOD', () => {
     );
   });
 
-  it('gives unfiltered movie and series lists a larger size and time budget than one category', async () => {
-    fetchTextMock.mockResolvedValue('[]');
-    const client = createXtreamClient(creds);
-    await client.getVodStreams();
-    await client.getSeries();
-    await client.getSeries('1');
-
-    const budgets = fetchTextMock.mock.calls.map(call => [call[1], call[2]]);
-    expect(budgets).toEqual([
-      [CONFIG.XTREAM.WHOLE_CATALOG_MAX_BYTES, CONFIG.XTREAM.WHOLE_CATALOG_TIMEOUT_MS],
-      [CONFIG.XTREAM.WHOLE_CATALOG_MAX_BYTES, CONFIG.XTREAM.WHOLE_CATALOG_TIMEOUT_MS],
-      [CONFIG.XTREAM.CATALOG_MAX_BYTES, 30000],
-    ]);
-    expect(CONFIG.XTREAM.WHOLE_CATALOG_MAX_BYTES).toBeGreaterThan(CONFIG.XTREAM.CATALOG_MAX_BYTES);
-  });
-
-  it('downloads the whole movie and series catalogs straight into columns', async () => {
-    fetchTextMock.mockResolvedValueOnce(JSON.stringify([
-      { stream_id: 10, name: 'Movie One', stream_icon: 'http://host/p/a.png', rating: '7.5',
-        category_id: '1', container_extension: 'mp4', added: '1700000000', plot: 'dropped' },
-      { stream_id: 10, name: 'Movie One', category_id: '2' },
-      { stream_id: '', name: 'No id' },
-      { stream_id: 20, name: 'Movie Two', category_id: '2' },
-    ]));
-    const movies = await createXtreamClient(creds, 'acc1').getVodCatalog();
-    expect(fetchTextMock.mock.calls[0].slice(0, 3)).toEqual([
-      expect.stringMatching(/action=get_vod_streams$/),
-      CONFIG.XTREAM.WHOLE_CATALOG_MAX_BYTES,
-      CONFIG.XTREAM.WHOLE_CATALOG_TIMEOUT_MS,
-    ]);
-    const table = new CatalogTable<VodItem>(movies);
-    expect(table.length).toBe(2);
-    expect(table.item(0)).toEqual({
-      accountId: 'acc1', streamId: '10', name: 'Movie One', poster: 'http://host/p/a.png',
-      rating: '7.5', categoryId: '1', containerExtension: 'mp4', addedAt: 1700000000000,
-    });
-    expect(table.idAt(1)).toBe('20');
-
-    fetchTextMock.mockResolvedValueOnce(JSON.stringify([
-      { series_id: 's1', name: 'Show', cover: 'http://host/c.png', category_id: '3', releaseDate: '2020-01-01' },
-    ]));
-    const shows = new CatalogTable<SeriesItem>(await createXtreamClient(creds, 'acc1').getSeriesCatalog());
-    expect(fetchTextMock.mock.calls[1][0]).toMatch(/action=get_series$/);
-    expect(shows.item(0)).toEqual({
-      accountId: 'acc1', seriesId: 's1', name: 'Show', poster: 'http://host/c.png',
-      rating: '', categoryId: '3', year: 2020,
-    });
-  });
-
   it('classifies oversized and cancelled catalog requests', async () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     fetchTextMock.mockRejectedValueOnce(
@@ -535,8 +683,8 @@ describe('XtreamClient VOD', () => {
       'event=xtream.request.failed',
       'endpoint=get_vod_streams',
       'code=too_large',
-      `timeoutMs=${CONFIG.XTREAM.WHOLE_CATALOG_TIMEOUT_MS}`,
-      `limitBytes=${CONFIG.XTREAM.WHOLE_CATALOG_MAX_BYTES}`,
+      'timeoutMs=30000',
+      `limitBytes=${CONFIG.XTREAM.CATALOG_MAX_BYTES}`,
     );
 
     warn.mockClear();

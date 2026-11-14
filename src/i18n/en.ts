@@ -131,10 +131,6 @@ export const EN_MESSAGES = {
   'catalog.seriesCount': {
     other: '{count} series',
   },
-  'catalog.episodeCount': {
-    one: '{count} episode',
-    other: '{count} episodes',
-  },
   'catalog.noMovies': 'No movies are available for this account.',
   'catalog.noMoviesCategory': 'No movies in this category.',
   'catalog.noSeries': 'No series are available for this account.',
@@ -197,6 +193,8 @@ export const EN_MESSAGES = {
     other: 'Starts in {count} seconds',
   },
   'player.playNow': 'Play now',
+  'player.previousEpisode': 'Previous episode',
+  'player.nextEpisode': 'Next episode',
   'player.unableToPlay': 'Unable to play this video.',
   'player.reconnecting': 'Reconnecting…',
   'player.retryingCatchup': 'Retrying catch-up…',
@@ -510,7 +508,6 @@ export const EN_MESSAGES = {
   'parental.askAfterLeaving': 'After leaving the app',
   'app.welcome': 'Welcome! Add a playlist URL to get started.',
   'app.loadingChannels': 'Loading channels…',
-  'app.loadingChannelsProgress': 'Loading channels… {processed} processed, {kept} kept',
   'app.channelsLoaded': {
     one: '{count} channel loaded',
     other: '{count} channels loaded',

@@ -7,7 +7,7 @@ import {
   type ParsedPlaylist,
   type PlaylistTab,
 } from '../types';
-import { fetchAndParseM3U } from '../parsers/m3u-loader';
+import { fetchAndParseM3U, stampCatchupClock } from '../parsers/m3u-loader';
 import type { M3ULoadProgress } from '../parsers/m3u-loader';
 import {
   xtreamPlaylistUrl,
@@ -35,6 +35,7 @@ import {
 } from '../utils/channel-search';
 import { createLogger } from '../utils/logger';
 import { StorageService } from './storage-service';
+import { releaseHeldRecord } from './held-records';
 import { ChannelCustomizationService, groupKeyOf } from './channel-customization';
 import {
   createXtreamClient,
@@ -43,7 +44,8 @@ import {
 } from './xtream-client';
 import {
   cacheRecordRef,
-  getCachedPlaylist,
+  openCachedPlaylist,
+  type CachedPlaylist,
   playlistCacheToken,
   scheduleCachedPlaylist,
   type CacheRecordRef,
@@ -59,13 +61,37 @@ import {
   type XtreamGroupNameFilter,
 } from '../utils/xtream-category-filter';
 import { liveParentalRequest, ParentalControlService } from './parental-control';
+import type { XtreamCatchupCounts } from '../workers/tasks';
 
 const log = createLogger('Playlist');
+
+function logXtreamCatchup(counts: XtreamCatchupCounts): void {
+  if (!counts.archived) return;
+  log.info(
+    'Xtream catch-up matching completed',
+    'event=xtream.catchup.matched',
+    `streams=${counts.streams}`,
+    `archived=${counts.archived}`,
+    `enabled=${counts.enabled}`,
+    `unmatched=${counts.unmatched}`,
+    `clock=${counts.clock}`,
+    ...(counts.clockFailure ? [`clockFailure=${counts.clockFailure}`] : []),
+  );
+  if (counts.unmatched) {
+    log.warn(
+      'Xtream catch-up streams could not be matched',
+      'event=xtream.catchup.unmatched',
+      `channels=${counts.unmatched}`,
+    );
+  }
+}
 
 export interface PlaylistLoadProgress {
   sourceNumber: number;
   sourceCount: number;
   inputBytes: number;
+  /** The source's size when its server reveals it. */
+  totalBytes?: number;
   channelsProcessed: number;
   channelsKept: number;
 }
@@ -78,6 +104,13 @@ export interface LiveCategoryNotice {
 
 interface PlaylistRefreshOptions {
   preserveOnFailure?: boolean;
+  /** Shows channels as they arrive; called after each batch joins `channels`. */
+  onChannels?: () => void;
+}
+
+export interface PlaylistLoadOptions {
+  /** Shows channels as they arrive; called after each batch joins `channels`. */
+  onChannels?: () => void;
 }
 
 function usableDirectSource(value: string): string {
@@ -148,9 +181,16 @@ class PlaylistServiceImpl {
   private channelsByPlaylistGroup = new Map<string, Map<string, Channel[]>>();
   private groupsByPlaylist = new Map<string, string[]>();
   private groupKeyByDisplay = new Map<string, string>();
+  private derivedGroups = new Set<string>();
+  private derivedPlaylistGroups = new Map<string, Set<string>>();
+  // The playlist owning every indexed channel: undefined before the first
+  // channel, null once a second playlist shows up.
+  private derivedSole: string | null | undefined = undefined;
+  private derivedGroupsSize = -1;
   // Channels sharing a key (one URL with other headers or DRM), in order.
-  private channelsByKey = new Map<string, Channel[]>();
-  private channelByLegacyKey = new Map<string, Channel | null>();
+  private channelsByKey: Map<string, Channel[]> | null = null;
+  // Built on the first key miss; most boots never need it.
+  private channelByLegacyKey: Map<string, Channel | null> | null = null;
   private channelSearchIndex: PreparedSearchItem<Channel>[] = [];
   private channelSearchByPlaylist = new Map<string, PreparedSearchItem<Channel>[]>();
   private indexedChannels: Channel[] | null = null;
@@ -161,6 +201,26 @@ class PlaylistServiceImpl {
   private failedSourceIds = new Set<string>();
   private liveCategoryNotices: LiveCategoryNotice[] = [];
   private refreshTimestamp: number | null = null;
+  // A load showing channels as they arrive; null once it ends.
+  private progressive: { generation: number } | null = null;
+  private progressiveGeneration = 0;
+  // Only the latest load counts: one it replaced may run on until its
+  // source times out, but no longer changes `channels`.
+  private loadCount = 0;
+  private latestLoadSettled = true;
+  private loadedOnce = false;
+  // A progressive load cleared the list and has not put a whole one back.
+  private listPartial = false;
+
+  /** True while a load is still adding channels to `channels`. */
+  get loading(): boolean {
+    return this.progressive !== null;
+  }
+
+  /** True once `channels` holds a whole playlist that no load is replacing. */
+  get complete(): boolean {
+    return this.loadedOnce && !this.listPartial && this.latestLoadSettled && !this.loading;
+  }
 
   hasLiveCategoryNotices(): boolean {
     return this.currentLiveCategoryNotices().length > 0;
@@ -246,8 +306,12 @@ class PlaylistServiceImpl {
    * list view.
    */
   reset(): void {
+    // No playlist is a whole list too: its reminders' channels are gone.
+    this.loadedOnce = true;
+    this.listPartial = false;
     this.failedSourceIds.clear();
     this.refreshTimestamp = null;
+    this.progressive = null;
     this.allChannels = [];
     this.channels = [];
     this.unconcealedChannels = [];
@@ -262,8 +326,8 @@ class PlaylistServiceImpl {
     this.channelsByPlaylistGroup = new Map();
     this.groupsByPlaylist = new Map();
     this.groupKeyByDisplay = new Map();
-    this.channelsByKey = new Map();
-    this.channelByLegacyKey = new Map();
+    this.channelsByKey = null;
+    this.channelByLegacyKey = null;
     this.channelSearchIndex = [];
     this.channelSearchByPlaylist = new Map();
     this.indexedChannels = null;
@@ -272,7 +336,25 @@ class PlaylistServiceImpl {
     this.searchIndexedChannelCount = -1;
   }
 
-  async load(onProgress?: (progress: PlaylistLoadProgress) => void): Promise<Channel[]> {
+  async load(
+    onProgress?: (progress: PlaylistLoadProgress) => void,
+    options: PlaylistLoadOptions = {},
+  ): Promise<Channel[]> {
+    const load = ++this.loadCount;
+    this.latestLoadSettled = false;
+    try {
+      const channels = await this.loadChannels(onProgress, options);
+      if (load === this.loadCount) this.loadedOnce = true;
+      return channels;
+    } finally {
+      if (load === this.loadCount) this.latestLoadSettled = true;
+    }
+  }
+
+  private async loadChannels(
+    onProgress: ((progress: PlaylistLoadProgress) => void) | undefined,
+    options: PlaylistLoadOptions,
+  ): Promise<Channel[]> {
     const enabledSources = StorageService.getPlaylists().filter(isSourceEnabled);
     const enabledIds = new Set(enabledSources.map(source => source.id));
     if (!enabledIds.size) {
@@ -282,44 +364,128 @@ class PlaylistServiceImpl {
     }
     // Boot from an expired cache too; App schedules the overdue refresh in the
     // background instead of blocking startup on a full download.
-    const cached = await getCachedPlaylist(null);
+    const load = this.loadCount;
+    const cached = await openCachedPlaylist(null);
     if (cached) {
-      this.failedSourceIds.clear();
-      this.refreshTimestamp = cached.timestamp;
-      const channelsNeedFiltering = cached.channels
-        .some(channel => channel.playlistIds.some(id => !enabledIds.has(id)));
-      this.allChannels = channelsNeedFiltering
-        ? cached.channels
-            .map(channel => ({
-              ...channel,
-              playlistIds: channel.playlistIds.filter(id => enabledIds.has(id)),
-            }))
-            .filter(channel => channel.playlistIds.length > 0)
-        : cached.channels;
-      const epgSourcesNeedFiltering = cached.epgSources
-        .some(source => source.playlistIds.some(id => !enabledIds.has(id)));
-      this.epgSources = epgSourcesNeedFiltering
-        ? cached.epgSources
-            .map(source => ({
-              ...source,
-              playlistIds: source.playlistIds.filter(id => enabledIds.has(id)),
-            }))
-            .filter(source => source.playlistIds.length > 0)
-        : cached.epgSources;
-      log.info('Cache hit:', this.allChannels.length, 'channels,', this.epgSources.length, 'epg sources');
-      this.applyCustomization();
-      this.buildPlaylistTabs();
-      StorageService.migrateFavoriteKeys(this.channels);
-      this.logLoadCompleted('cache', enabledIds.size, 0);
-      return this.channels;
+      const fromCache = await this.loadCached(cached, enabledIds, onProgress, options);
+      if (fromCache) return fromCache;
+      // A newer load took over, perhaps after clearing the cache under this one.
+      if (load !== this.loadCount) return this.channels;
+      log.info('Cached playlist unreadable — refreshing from network');
+      return this.refresh(onProgress, { onChannels: options.onChannels });
     }
     log.info('Cache miss — refreshing from network');
-    return this.refresh(onProgress);
+    return this.refresh(onProgress, { onChannels: options.onChannels });
+  }
+
+  // Shows the cached channels a chunk at a time when asked to. Null when a
+  // chunk was unreadable; the cache then counts as missing.
+  private async loadCached(
+    cached: CachedPlaylist,
+    enabledIds: Set<string>,
+    onProgress: ((progress: PlaylistLoadProgress) => void) | undefined,
+    options: PlaylistLoadOptions,
+  ): Promise<Channel[] | null> {
+    // The source signature already rules out a disabled source; the ids
+    // guard a hash collision and older records without them.
+    const sourcesStillEnabled = !!cached.sourceIds
+      && cached.sourceIds.every(id => enabledIds.has(id));
+    const enabledOnly = (chunk: Channel[]): Channel[] => {
+      if (sourcesStillEnabled
+        || !chunk.some(channel => channel.playlistIds.some(id => !enabledIds.has(id)))) {
+        return chunk;
+      }
+      return chunk
+        .map(channel => ({
+          ...channel,
+          playlistIds: channel.playlistIds.filter(id => enabledIds.has(id)),
+        }))
+        .filter(channel => channel.playlistIds.length > 0);
+    };
+    // A progressive load still running must not add to the cached list.
+    this.progressive = null;
+    const progressive = options.onChannels ? this.beginProgressive() : null;
+    if (progressive) options.onChannels?.();
+    const parts: Channel[][] = [];
+    let filtered = false;
+    let read = 0;
+    let kept = 0;
+    let all: Channel[] | null;
+    try {
+      all = await cached.readChannels((chunk) => {
+        const part = enabledOnly(chunk);
+        if (part !== chunk) filtered = true;
+        parts.push(part);
+        read += chunk.length;
+        kept += part.length;
+        if (!progressive) return true;
+        if (this.progressive !== progressive) return false;
+        this.appendProgressive(progressive, part);
+        onProgress?.({
+          sourceNumber: 1,
+          sourceCount: 1,
+          inputBytes: read,
+          totalBytes: cached.channelCount,
+          channelsProcessed: read,
+          channelsKept: kept,
+        });
+        options.onChannels?.();
+        return true;
+      });
+    } catch (err) {
+      if (progressive && this.progressive === progressive) this.progressive = null;
+      throw err;
+    }
+    // reset(), another cache hit, or a newer load took over while this one read.
+    if (progressive && this.progressive !== progressive) return this.channels;
+    if (!all) {
+      if (progressive) this.progressive = null;
+      return null;
+    }
+    this.listPartial = false;
+    this.failedSourceIds.clear();
+    this.refreshTimestamp = cached.timestamp;
+    const final = filtered ? ([] as Channel[]).concat(...parts) : all;
+    const adopted = progressive ? this.endProgressive(progressive, final, true) : false;
+    this.allChannels = final;
+    const epgSourcesNeedFiltering = !sourcesStillEnabled && cached.epgSources
+      .some(source => source.playlistIds.some(id => !enabledIds.has(id)));
+    this.epgSources = epgSourcesNeedFiltering
+      ? cached.epgSources
+          .map(source => ({
+            ...source,
+            playlistIds: source.playlistIds.filter(id => enabledIds.has(id)),
+          }))
+          .filter(source => source.playlistIds.length > 0)
+      : cached.epgSources;
+    log.info('Cache hit:', this.allChannels.length, 'channels,', this.epgSources.length, 'epg sources');
+    if (!adopted) this.applyCustomization();
+    this.buildPlaylistTabs();
+    StorageService.migrateFavoriteKeys(this.channels);
+    this.logLoadCompleted('cache', enabledIds.size, 0);
+    return this.channels;
   }
 
   async refresh(
     onProgress?: (progress: PlaylistLoadProgress) => void,
     options: PlaylistRefreshOptions = {},
+  ): Promise<Channel[]> {
+    // beginProgressive() runs before the first await, so it takes this number.
+    const generation = options.onChannels && !options.preserveOnFailure
+      ? this.progressiveGeneration + 1
+      : -1;
+    try {
+      return await this.refreshSources(onProgress, options);
+    } catch (err) {
+      // Its progressive load ends here, or `loading` would stay true.
+      if (this.progressive?.generation === generation) this.progressive = null;
+      throw err;
+    }
+  }
+
+  private async refreshSources(
+    onProgress: ((progress: PlaylistLoadProgress) => void) | undefined,
+    options: PlaylistRefreshOptions,
   ): Promise<Channel[]> {
     const done = log.time('refresh');
     const cacheToken = playlistCacheToken();
@@ -332,10 +498,23 @@ class PlaylistServiceImpl {
       return [];
     }
 
-    const allChannels: Channel[] = [];
-    const byUrl = new Map<string, Channel>();
+    const progressive = options.onChannels && !options.preserveOnFailure
+      ? this.beginProgressive()
+      : null;
+    // The list the load replaces is gone now.
+    if (progressive) options.onChannels?.();
+    let allChannels: Channel[] = [];
+    let byUrl: Map<string, Channel> | null = null;
+    const streamIndex = (): Map<string, Channel> => {
+      if (!byUrl) {
+        byUrl = new Map();
+        for (const ch of allChannels) byUrl.set(channelExactStreamIdentity(ch), ch);
+      }
+      return byUrl;
+    };
     const epgSources: EpgSource[] = [];
     let failedPlaylists = 0;
+    let loadedSources = 0;
     const failedSourceIds = new Set<string>();
     let completedProcessed = 0;
     let completedKept = 0;
@@ -349,6 +528,8 @@ class PlaylistServiceImpl {
     };
 
     for (let playlistIndex = 0; playlistIndex < playlists.length; playlistIndex++) {
+      // A newer load took over: the rest of this one would be thrown away.
+      if (progressive && this.progressive !== progressive) break;
       const pl = playlists[playlistIndex];
       const load = playlistIndex + 1;
       const source = pl.source === 'xtream' ? 'xtream' : 'm3u';
@@ -443,10 +624,23 @@ class PlaylistServiceImpl {
         );
       }
       const plDone = log.time(`fetch '${pl.name || pl.url}'`);
+      // Channels the worker keeps to write the cache; any change here drops them.
+      let workerChannels: Channel[] | null = null;
+      let streamed = false;
       try {
         let parsed: ParsedPlaylist | null = null;
+        let workerDuplicates: number | null = null;
+        let workerCatchup: XtreamCatchupCounts | undefined;
         let playlistError: unknown;
         try {
+          // Only the first source streams in; later ones merge when they finish.
+          const onChannels = progressive && !allChannels.length
+            ? (batch: Channel[]) => {
+                if (!this.appendProgressive(progressive, batch)) return;
+                streamed = true;
+                options.onChannels?.();
+              }
+            : undefined;
           const loaded = await fetchAndParseM3U(
             fetchUrl,
             60000,
@@ -459,13 +653,29 @@ class PlaylistServiceImpl {
                 sourceNumber: load,
                 sourceCount: playlists.length,
                 inputBytes: progress.inputBytes,
+                ...(progress.totalBytes ? { totalBytes: progress.totalBytes } : {}),
                 channelsProcessed: completedProcessed + sourceProcessed,
                 channelsKept: completedKept + sourceKept,
               });
             },
             xtreamGroupFilter,
+            plKey,
+            playlists.length === 1,
+            xtreamCredentials && xtreamCatalogAvailable
+              ? {
+                  accountId: plKey,
+                  credentials: xtreamCredentials,
+                  output: xtreamOutput,
+                  catalogStreams: xtreamStreams?.length ?? 0,
+                  catalogArchived: xtreamStreams?.filter(stream => stream.archive).length ?? 0,
+                }
+              : undefined,
+            onChannels,
           );
           parsed = loaded.data;
+          workerChannels = parsed.channels;
+          workerDuplicates = loaded.metrics.duplicates ?? null;
+          workerCatchup = loaded.metrics.catchup;
         } catch (err) {
           playlistError = err;
           if (!xtreamCredentials) throw err;
@@ -502,6 +712,8 @@ class PlaylistServiceImpl {
             `streams=${String(streams.length)}`,
           );
           if (streams.length) {
+            workerDuplicates = null;
+            workerCatchup = undefined;
             parsed = xtreamLivePlaylist(
               xtreamCredentials,
               xtreamOutput,
@@ -514,14 +726,26 @@ class PlaylistServiceImpl {
         }
         if (!parsed) throw new Error('Xtream source returned no playlist or live catalog');
 
-        if (xtreamCredentials) {
-          await this.applyXtreamCatchup(
+        if (workerCatchup) {
+          logXtreamCatchup(workerCatchup);
+          const lateClock = workerCatchup.lateClock;
+          if (lateClock) {
+            // Rare: the panel clock missed the worker's stamping, so the page
+            // adds the time zone and writes the cache itself.
+            for (const channel of parsed.channels) {
+              if (channel.catchupAccountId === plKey) stampCatchupClock(channel, lateClock);
+            }
+            releaseHeldRecord(parsed.channels);
+          }
+        } else if (xtreamCredentials) {
+          const changed = await this.applyXtreamCatchup(
             parsed.channels,
             xtreamCredentials,
             plKey,
             xtreamOutput,
             fallbackStreams ?? xtreamStreams,
           );
+          if (changed) releaseHeldRecord(parsed.channels);
         }
         if (parsed.issues.length) {
           log.warn('Playlist diagnostics:',
@@ -529,28 +753,39 @@ class PlaylistServiceImpl {
         }
         log.info('Parsed', parsed.channels.length, 'channels,', parsed.groups.length, 'groups',
           parsed.epgUrl ? `| epg: ${parsed.epgUrl}` : '');
-        let added = 0, dupes = 0;
+        // The worker already dropped this playlist's own copies.
+        let added = 0, dupes = workerDuplicates ?? 0;
         // Merging de-duplicates by stream: the same location sent with other
         // headers or options is another channel. channelKey stays URL-only,
         // so a plain channel keeps its favorites and history. The location is
         // compared exactly: entries differing only by a token may come from
         // different accounts, and each must keep its own working token.
-        for (const ch of parsed.channels) {
-          const identity = channelExactStreamIdentity(ch);
-          const existing = byUrl.get(identity);
-          if (existing) {
-            // Same stream in an earlier playlist: keep the one channel object
-            // (so "All" stays de-duplicated), but record this playlist too so
-            // its own tab still appears and shows the channel.
-            if (!existing.playlistIds.includes(plKey)) existing.playlistIds.push(plKey);
-            dupes++;
-          } else {
-            ch.playlistIds = [plKey];
-            byUrl.set(identity, ch);
-            allChannels.push(ch);
-            added++;
+        if (workerDuplicates !== null && !allChannels.length) {
+          allChannels = parsed.channels;
+          added = parsed.channels.length;
+        } else {
+          // A merge changes the channels, so no worker copy matches them now.
+          releaseHeldRecord(allChannels);
+          releaseHeldRecord(parsed.channels);
+          for (const ch of parsed.channels) {
+            const identity = channelExactStreamIdentity(ch);
+            const index = streamIndex();
+            const existing = index.get(identity);
+            if (existing) {
+              // Same stream in an earlier playlist: keep the one channel object
+              // (so "All" stays de-duplicated), but record this playlist too so
+              // its own tab still appears and shows the channel.
+              if (!existing.playlistIds.includes(plKey)) existing.playlistIds.push(plKey);
+              dupes++;
+            } else {
+              ch.playlistIds = [plKey];
+              index.set(identity, ch);
+              allChannels.push(ch);
+              added++;
+            }
           }
         }
+        loadedSources++;
         log.debug(`Added ${added} channels (${dupes} duplicates skipped)`);
         if (pl.source === 'xtream' && pl.xtream) {
           // The panel's own XMLTV endpoint; the get.php url-tvg (if any) is added below too.
@@ -576,13 +811,19 @@ class PlaylistServiceImpl {
           'event=playlist.source.load.completed',
           `load=${String(load)}`,
           `source=${source}`,
-          `channels=${String(parsed.channels.length)}`,
+          `channels=${String(parsed.channels.length + (workerDuplicates ?? 0))}`,
           `added=${String(added)}`,
           `duplicates=${String(dupes)}`,
           `epg=${String(epgSources.length - sourceEpgStart)}`,
           `elapsedMs=${String(Date.now() - sourceStarted)}`,
         );
       } catch (err) {
+        releaseHeldRecord(workerChannels);
+        // The next source streams in place of the failed one's partial list.
+        if (progressive && streamed && this.progressive === progressive) {
+          this.clearProgressive();
+          options.onChannels?.();
+        }
         failedPlaylists++;
         failedSourceIds.add(plKey);
         log.error(
@@ -610,6 +851,12 @@ class PlaylistServiceImpl {
       plDone();
     }
 
+    // reset(), a cache hit, or a newer load took over while this one ran.
+    if (progressive && this.progressive !== progressive) {
+      releaseHeldRecord(allChannels);
+      done();
+      return this.channels;
+    }
     this.failedSourceIds = failedSourceIds;
     if (failedPlaylists && options.preserveOnFailure) {
       log.warn(
@@ -617,12 +864,19 @@ class PlaylistServiceImpl {
         'event=playlist.refresh.preserved',
         `failed=${String(failedPlaylists)}`,
       );
+      releaseHeldRecord(allChannels);
       this.logLoadCompleted('network', playlists.length, failedPlaylists);
       done();
       return this.channels;
     }
     const refreshTimestamp = Date.now();
+    // A later source merged into the shown channels changes their playlists.
+    const adopted = progressive
+      ? this.endProgressive(progressive, allChannels, loadedSources <= 1)
+      : false;
     this.allChannels = allChannels;
+    // A newer load still streaming keeps the list partial.
+    if (!this.progressive) this.listPartial = false;
     this.epgSources = epgSources;
     // Customization preserves source names/groups on each channel, so cached
     // channels can be re-customized after an edit without another network load.
@@ -634,12 +888,14 @@ class PlaylistServiceImpl {
         refreshTimestamp,
         StorageService.getPlaylistRefreshIntervalMs(),
         cacheToken,
+        playlists.map(pl => pl.id),
       );
     } else {
       this.refreshTimestamp = null;
+      releaseHeldRecord(allChannels);
       log.warn('Skipping cache write because one or more playlists failed');
     }
-    this.applyCustomization();
+    if (!adopted) this.applyCustomization();
     this.buildPlaylistTabs();
     StorageService.migrateFavoriteKeys(this.channels);
     log.info('Refresh complete:', allChannels.length, 'total channels,', epgSources.length, 'epg sources');
@@ -678,13 +934,13 @@ class PlaylistServiceImpl {
     accountId: string,
     output: XtreamLiveOutput,
     knownStreams?: XtreamLiveStream[],
-  ): Promise<void> {
+  ): Promise<number> {
     const client = createXtreamClient(credentials);
     const streams = knownStreams ?? await client.getLiveStreams();
     const archived = new Map(streams
       .filter(stream => stream.archive)
       .map(stream => [stream.streamId, stream]));
-    if (!archived.size) return;
+    if (!archived.size) return 0;
 
     const clock = await client.getServerClock();
     const knownIds = new Set(streams.map(stream => stream.streamId));
@@ -694,6 +950,7 @@ class PlaylistServiceImpl {
     );
     let enabled = 0;
     let unmatched = 0;
+    let changed = 0;
     for (const channel of channels) {
       const streamId = channel.catchupStreamId && knownIds.has(channel.catchupStreamId)
         ? channel.catchupStreamId
@@ -703,6 +960,7 @@ class PlaylistServiceImpl {
         if (!streamId) unmatched++;
         continue;
       }
+      changed++;
       channel.catchupStreamId = streamId;
       channel.catchupAccountId = accountId;
       if (!channel.catchupSource) {
@@ -714,21 +972,110 @@ class PlaylistServiceImpl {
       if (clock?.timeZone) channel.catchupTimeZone = clock.timeZone;
       if (clock?.offsetMinutes != null) channel.catchupTimeOffsetMinutes = clock.offsetMinutes;
     }
-    log.info(
-      'Xtream catch-up matching completed',
-      'event=xtream.catchup.matched',
-      `streams=${streams.length}`,
-      `archived=${archived.size}`,
-      `enabled=${enabled}`,
-      `unmatched=${unmatched}`,
+    logXtreamCatchup({
+      streams: streams.length,
+      archived: archived.size,
+      enabled,
+      unmatched,
+      clock: clock ? 'ok' : 'missing',
+    });
+    return changed;
+  }
+
+  private beginProgressive(): { generation: number } {
+    const progressive = { generation: ++this.progressiveGeneration };
+    this.progressive = progressive;
+    this.listPartial = true;
+    this.clearProgressive();
+    return progressive;
+  }
+
+  private clearProgressive(): void {
+    this.allChannels = [];
+    this.unconcealedChannels = [];
+    this.channels = this.unconcealedChannels;
+    this.channelSourceIndices = new Uint32Array(0);
+    this.buildDerivedIndexes();
+    this.buildPlaylistTabs();
+  }
+
+  // Customizes, conceals, and indexes one arriving batch in source order;
+  // a custom channel order waits for the full list.
+  private appendProgressive(progressive: { generation: number }, batch: Channel[]): boolean {
+    if (this.progressive !== progressive || !batch.length) return false;
+    const base = this.allChannels.length;
+    for (const ch of batch) this.allChannels.push(ch);
+    const batchIndices = new Uint32Array(batch.length);
+    const visible = ChannelCustomizationService.applyTo(
+      batch,
+      this.includeHidden || StorageService.getShowHiddenChannels(),
+      batchIndices,
+      true,
     );
-    if (unmatched) {
-      log.warn(
-        'Xtream catch-up streams could not be matched',
-        'event=xtream.catchup.unmatched',
-        `channels=${unmatched}`,
-      );
+    const from = this.channels.length;
+    let indices = this.channelSourceIndices;
+    if (indices.buffer.byteLength < (from + visible.length) * 4) {
+      const grown = new Uint32Array(Math.max(1024, (from + visible.length) * 2));
+      grown.set(indices);
+      indices = grown;
+    } else {
+      indices = new Uint32Array(indices.buffer, 0, indices.buffer.byteLength / 4);
     }
+    let length = from;
+    for (let i = 0; i < visible.length; i++) {
+      const ch = visible[i];
+      const concealed = ParentalControlService.concealing
+        && ParentalControlService.isConcealed(liveParentalRequest(ch));
+      // The first concealed channel splits the two lists.
+      if (concealed && this.channels === this.unconcealedChannels) {
+        this.channels = this.unconcealedChannels.slice();
+      }
+      if (this.channels !== this.unconcealedChannels) this.unconcealedChannels.push(ch);
+      if (concealed) continue;
+      this.channels.push(ch);
+      indices[length++] = base + batchIndices[i];
+    }
+    this.channelSourceIndices = indices.subarray(0, length);
+    if (this.channelsByKey) {
+      for (let i = from; i < length; i++) {
+        this.appendIndexed(this.channelsByKey, channelKey(this.channels[i]), this.channels[i]);
+      }
+    }
+    this.channelByLegacyKey = null;
+    this.indexDerived(from);
+    this.publishDerivedIndexes();
+    return true;
+  }
+
+  /**
+   * Ends a progressive load. Returns true when the shown channels already
+   * are `final` customized, so the full pass can be skipped; the lists get
+   * new identities either way, so views caching by identity rebuild.
+   */
+  private endProgressive(
+    progressive: { generation: number },
+    final: Channel[],
+    adoptable: boolean,
+  ): boolean {
+    if (this.progressive !== progressive) return false;
+    this.progressive = null;
+    const shown = this.allChannels;
+    if (!adoptable || ChannelCustomizationService.hasCustomOrder
+      || shown.length !== final.length) return false;
+    for (let i = 0; i < final.length; i++) if (shown[i] !== final[i]) return false;
+    const shared = this.channels === this.unconcealedChannels;
+    this.unconcealedChannels = this.unconcealedChannels.slice();
+    this.channels = shared ? this.unconcealedChannels : this.channels.slice();
+    this.channelSourceIndices = this.channelSourceIndices.slice();
+    if (this.derivedSole) this.channelsByPlaylist.set(this.derivedSole, this.channels);
+    this.channelSearchIndex = [];
+    this.channelSearchByPlaylist = new Map();
+    this.searchIndexedChannels = null;
+    this.searchIndexedChannelCount = -1;
+    this.indexedChannels = this.channels;
+    this.indexedChannelCount = this.channels.length;
+    this.groupsRevision++;
+    return true;
   }
 
   /**
@@ -806,72 +1153,138 @@ class PlaylistServiceImpl {
   }
 
   private buildDerivedIndexes(): void {
-    const groupSet = new Set<string>();
-    const groupSetsByPlaylist = new Map<string, Set<string>>();
+    this.resetDerivedIndexes();
+    this.indexDerived(0);
+    this.publishDerivedIndexes();
+  }
+
+  private resetDerivedIndexes(): void {
     this.indexMap = new Map();
     this.channelsByGroup = new Map();
     this.channelsByPlaylist = new Map();
     this.channelsByPlaylistGroup = new Map();
     this.groupKeyByDisplay = new Map();
-    this.channelsByKey = new Map();
-    this.channelByLegacyKey = new Map();
+    this.derivedGroups = new Set();
+    this.derivedPlaylistGroups = new Map();
+    this.derivedSole = undefined;
+    this.derivedGroupsSize = -1;
+    this.channelsByKey = null;
+    this.channelByLegacyKey = null;
     this.channelSearchIndex = [];
     this.channelSearchByPlaylist = new Map();
     this.searchIndexedChannels = null;
     this.searchIndexedChannelCount = -1;
-
     for (const key of ChannelCustomizationService.customGroups) {
       this.groupKeyByDisplay.set(ChannelCustomizationService.groupLabel(key), key);
     }
+  }
 
-    for (let i = 0; i < this.channels.length; i++) {
+  // Indexes `channels` from `from` on; a progressive load calls it per batch.
+  private indexDerived(from: number): void {
+    for (let i = from; i < this.channels.length; i++) {
       const ch = this.channels[i];
       this.indexMap.set(ch, i);
-      const key = channelKey(ch);
-      this.appendIndexed(this.channelsByKey, key, ch);
-      // A legacy key is ambiguous only across different streams, not across
-      // entries that share one channelKey.
-      const legacyKey = legacyChannelKey(ch);
-      const legacy = this.channelByLegacyKey.get(legacyKey);
-      if (legacy === undefined) this.channelByLegacyKey.set(legacyKey, ch);
-      else if (legacy && channelKey(legacy) !== key) this.channelByLegacyKey.set(legacyKey, null);
       if (ch.group) {
-        groupSet.add(ch.group);
+        this.derivedGroups.add(ch.group);
         if (!this.groupKeyByDisplay.has(ch.group)) {
           this.groupKeyByDisplay.set(ch.group, groupKeyOf(ch));
         }
         this.appendIndexed(this.channelsByGroup, ch.group, ch);
       }
-      for (const playlistId of ch.playlistIds) {
-        this.appendIndexed(this.channelsByPlaylist, playlistId, ch);
-        if (!ch.group) continue;
-        let byGroup = this.channelsByPlaylistGroup.get(playlistId);
-        if (!byGroup) {
-          byGroup = new Map();
-          this.channelsByPlaylistGroup.set(playlistId, byGroup);
-        }
-        this.appendIndexed(byGroup, ch.group, ch);
-        let playlistGroups = groupSetsByPlaylist.get(playlistId);
-        if (!playlistGroups) {
-          playlistGroups = new Set();
-          groupSetsByPlaylist.set(playlistId, playlistGroups);
-        }
-        playlistGroups.add(ch.group);
+      // Assume one playlist owns every channel, as it usually does, and index
+      // per playlist only from the first channel that proves otherwise.
+      if (this.derivedSole === undefined) {
+        this.derivedSole = ch.playlistIds.length === 1 ? ch.playlistIds[0] : null;
+        if (this.derivedSole !== null) continue;
+      } else if (this.derivedSole !== null) {
+        if (ch.playlistIds.length === 1 && ch.playlistIds[0] === this.derivedSole) continue;
+        this.splitSolePlaylist(i);
       }
+      this.indexByPlaylist(ch);
     }
-    for (const key of ChannelCustomizationService.customGroups) {
-      const label = ChannelCustomizationService.groupLabel(key);
-      groupSet.add(label);
-      this.groupKeyByDisplay.set(label, key);
+    if (this.derivedSole && this.channels.length) {
+      // One playlist owns every channel: its indexes are the global ones.
+      this.channelsByPlaylist.set(this.derivedSole, this.channels);
+      this.channelsByPlaylistGroup.set(this.derivedSole, this.channelsByGroup);
+      this.derivedPlaylistGroups.set(this.derivedSole, this.derivedGroups);
     }
-    this.groups = this.orderGroups(Array.from(groupSet));
-    this.groupsByPlaylist = new Map();
-    groupSetsByPlaylist.forEach((playlistGroups, playlistId) => {
-      this.groupsByPlaylist.set(playlistId, this.orderGroups(Array.from(playlistGroups)));
-    });
+  }
+
+  private splitSolePlaylist(at: number): void {
+    const sole = this.derivedSole;
+    this.derivedSole = null;
+    if (sole) {
+      this.channelsByPlaylist.delete(sole);
+      this.channelsByPlaylistGroup.delete(sole);
+      this.derivedPlaylistGroups.delete(sole);
+    }
+    for (let j = 0; j < at; j++) this.indexByPlaylist(this.channels[j]);
+  }
+
+  private indexByPlaylist(ch: Channel): void {
+    for (const playlistId of ch.playlistIds) {
+      this.appendIndexed(this.channelsByPlaylist, playlistId, ch);
+      if (!ch.group) continue;
+      let byGroup = this.channelsByPlaylistGroup.get(playlistId);
+      if (!byGroup) {
+        byGroup = new Map();
+        this.channelsByPlaylistGroup.set(playlistId, byGroup);
+      }
+      this.appendIndexed(byGroup, ch.group, ch);
+      let playlistGroups = this.derivedPlaylistGroups.get(playlistId);
+      if (!playlistGroups) {
+        playlistGroups = new Set();
+        this.derivedPlaylistGroups.set(playlistId, playlistGroups);
+      }
+      playlistGroups.add(ch.group);
+    }
+  }
+
+  private publishDerivedIndexes(): void {
+    let size = this.derivedGroups.size;
+    this.derivedPlaylistGroups.forEach(groups => { size += groups.size; });
+    // Sorting thousands of groups per batch of a progressive load adds up;
+    // the order only changes when a group appears.
+    if (size !== this.derivedGroupsSize) {
+      this.derivedGroupsSize = size;
+      const names = Array.from(this.derivedGroups);
+      for (const key of ChannelCustomizationService.customGroups) {
+        const label = ChannelCustomizationService.groupLabel(key);
+        if (!this.derivedGroups.has(label)) names.push(label);
+        this.groupKeyByDisplay.set(label, key);
+      }
+      this.groups = this.orderGroups(names);
+      this.groupsByPlaylist = new Map();
+      this.derivedPlaylistGroups.forEach((playlistGroups, playlistId) => {
+        this.groupsByPlaylist.set(playlistId, this.orderGroups(Array.from(playlistGroups)));
+      });
+    }
     this.indexedChannels = this.channels;
     this.indexedChannelCount = this.channels.length;
     this.groupsRevision++;
+  }
+
+  private keyIndex(): Map<string, Channel[]> {
+    if (this.channelsByKey) return this.channelsByKey;
+    const index = new Map<string, Channel[]>();
+    for (const ch of this.channels) this.appendIndexed(index, channelKey(ch), ch);
+    this.channelsByKey = index;
+    return index;
+  }
+
+  private legacyKeyIndex(): Map<string, Channel | null> {
+    if (this.channelByLegacyKey) return this.channelByLegacyKey;
+    const index = new Map<string, Channel | null>();
+    for (const ch of this.channels) {
+      // A legacy key is ambiguous only across different streams, not across
+      // entries that share one channelKey.
+      const legacyKey = legacyChannelKey(ch);
+      const legacy = index.get(legacyKey);
+      if (legacy === undefined) index.set(legacyKey, ch);
+      else if (legacy && channelKey(legacy) !== channelKey(ch)) index.set(legacyKey, null);
+    }
+    this.channelByLegacyKey = index;
+    return index;
   }
 
   private appendIndexed<T>(map: Map<string, T[]>, key: string, channel: T): void {
@@ -936,7 +1349,7 @@ class PlaylistServiceImpl {
     if (group === 'builtin:all' || group === 'builtin:recently-watched') return all;
     if (group === 'builtin:favorites') {
       const favorites = StorageService.getFavorites()
-        .map(key => this.channelsByKey.get(key)
+        .map(key => this.keyIndex().get(key)
           ?.find(channel => !playlist || channel.playlistIds.includes(playlist)))
         .filter((channel): channel is Channel => !!channel);
       favorites.sort((a, b) => this.indexOf(a) - this.indexOf(b));
@@ -1013,7 +1426,7 @@ class PlaylistServiceImpl {
     exactStream?: string,
   ): { channel: Channel; channelIndex: number } | null {
     this.ensureDerivedIndexes();
-    const shared = this.channelsByKey.get(key) ?? [];
+    const shared = this.keyIndex().get(key) ?? [];
     const same = stream
       ? shared.filter(channel => channelStreamIdentity(channel) === stream)
       : [];
@@ -1022,7 +1435,7 @@ class PlaylistServiceImpl {
       : [];
     const pick = (list: Channel[]) => (prefer && list.find(prefer)) || list[0];
     const channel = pick(exact) ?? pick(same) ?? pick(shared)
-      ?? this.channelByLegacyKey.get(key);
+      ?? this.legacyKeyIndex().get(key);
     if (!channel) return null;
     const channelIndex = this.indexOf(channel);
     return channelIndex < 0 ? null : { channel, channelIndex };
@@ -1034,6 +1447,20 @@ class PlaylistServiceImpl {
     if (!key) return -1;
     for (let i = 0; i < this.channels.length; i++) {
       if (channelKey(this.channels[i]) === key) return i;
+    }
+    return -1;
+  }
+
+  /**
+   * The last channel's index among `channels[from..]` while they still
+   * arrive, or -1. Only its exact stream counts: a later batch may hold a
+   * better match for anything less, which the whole list resolves.
+   */
+  findArrivedLastChannel(last: LastChannel, from: number): number {
+    if (!last.key || !last.exact) return -1;
+    for (let i = Math.max(0, from); i < this.channels.length; i++) {
+      const channel = this.channels[i];
+      if (channelKey(channel) === last.key && channelExactStreamKey(channel) === last.exact) return i;
     }
     return -1;
   }

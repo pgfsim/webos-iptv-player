@@ -22,6 +22,13 @@ export const CONFIG = {
   DEFAULT_PLAYLIST_REFRESH_INTERVAL_MS: 6 * 60 * 60 * 1000,
   WORKER_IDLE_TERMINATION_MS: 1000,
   PLAYLIST_CACHE_WRITE_DELAY_MS: 1200,
+  // Channels still arriving re-render the list at most this often; each
+  // render competes with the arriving batches for the main thread.
+  PLAYLIST_ARRIVAL_RENDER_MS: 1000,
+  // The load progress text and bar update at most this often.
+  PLAYLIST_PROGRESS_UPDATE_MS: 250,
+  // Without a known size, the load bar covers 63% of the way per this many bytes.
+  PLAYLIST_PROGRESS_SCALE_BYTES: 32 * 1024 * 1024,
   DEFAULT_EPG_REFRESH_INTERVAL_MS: 6 * 60 * 60 * 1000,
   REMINDER_SCAN_INTERVAL: 30 * 1000,
   CHANNEL_SCROLLBAR_HIDE_MS: 900,
@@ -100,6 +107,7 @@ export const CONFIG = {
     SUBTITLE_OFFSET_MAX: 60,    // max |offset| the adjuster allows (seconds)
     SUBTITLE_SEARCH_TIMEOUT: 8000, // ms one online provider may take before the merged search gives up on it
     UP_NEXT_COUNTDOWN: 10,      // seconds before the queued episode/movie starts automatically
+    EPISODE_SKIP_SETTLE_MS: 600, // CH presses within this land on one episode before its stream starts
     LUNA_MEDIA_PLACEHOLDER: 'resources/black.mp4',
     LUNA_MEDIA_WINDOW_TIMEOUT_MS: 3000, // placeholder clip load + getForegroundAppInfo budget
     LUNA_MEDIA_WINDOW_POLL_MS: 100,     // video.mediaId / window ID poll cadence
@@ -131,24 +139,38 @@ export const CONFIG = {
     MAX_RETAINED_PROGRAMMES: 120_000,
     // Visibility and mapping edits arrive one per keypress; coalesce them.
     CHANNEL_CHANGE_RELOAD_DELAY: 2000,
+    // Longest stretch of reading the cached guide before input gets a turn.
+    CACHE_DECODE_SLICE_MS: 16,
   },
 
   // Xtream Movies/Series catalog + resume tuning.
   XTREAM: {
     DEFAULT_CATALOG_REFRESH_INTERVAL_MS: 6 * 60 * 60 * 1000,
-    // After an unfiltered movie or series list fails, Search waits this long
-    // before requesting it again, so a refusing panel is not asked on every open.
-    WHOLE_CATALOG_RETRY_MS: 60 * 60 * 1000,
-    // Unfiltered lists are parsed as they stream in, so memory follows the
-    // kept fields, not the download; this only bounds a runaway response.
-    WHOLE_CATALOG_MAX_BYTES: 256 * 1024 * 1024,
-    WHOLE_CATALOG_TIMEOUT_MS: 3 * 60 * 1000,
+    CATALOG_RETRY_DELAY_MS: 60 * 1000,
+    CATALOG_LOAD_BUDGET_MS: 60 * 1000,
+    CATALOG_LOAD_CONCURRENCY: 2,
     // The search catalog downloads this long after startup, once the channel
     // list and any resumed stream have settled, so Search finds it ready.
     SEARCH_CATALOG_PRELOAD_DELAY_MS: 10 * 1000,
     ACCOUNT_MAX_BYTES: 1024 * 1024,      // account/server metadata response budget
+    // How long a playlist load, once its headers arrive, still waits for the panel
+    // clock before stamping catch-up without it.
+    CATCHUP_CLOCK_WAIT_MS: 5000,
     CATEGORY_MAX_BYTES: 2 * 1024 * 1024, // category-list response budget
     CATALOG_MAX_BYTES: 32 * 1024 * 1024, // full or per-category stream-list budget
+    // One streamed request for a whole catalog; the worker keeps only parsed items.
+    WHOLE_CATALOG_MAX_BYTES: 256 * 1024 * 1024,
+    WHOLE_CATALOG_TIMEOUT_MS: 5 * 60 * 1000,
+    WHOLE_CATALOG_HEADERS_TIMEOUT_MS: 2 * 60 * 1000,
+    // After any failed or empty whole request, or with stale categories, try
+    // it again this much later. It never falls back to one request per
+    // category: on a large panel that is hundreds of requests, enough for a
+    // provider to block the account.
+    WHOLE_CATALOG_RETRY_MS: 60 * 60 * 1000,
+    // The worker's cache write of a whole catalog; a slow TV needs tens of seconds.
+    HELD_WRITE_TIMEOUT_MS: 2 * 60 * 1000,
+    // How long the worker keeps a list it sent, waiting for the page to cache it.
+    HELD_LIST_MS: 2 * 60 * 1000,
     DETAIL_MAX_BYTES: 8 * 1024 * 1024,   // VOD/series detail and episode response budget
     BACKGROUND_REFRESH_CONCURRENCY: 2,   // stale catalog lists re-fetched at once; the rest queue
     RAIL_CATEGORIES: 6,                  // categories preloaded as rails in the browse view
@@ -177,6 +199,8 @@ export const CONFIG = {
   SEARCH: {
     // Budget for the worker's IndexedDB reads before the page posts the index instead.
     CACHE_READ_TIMEOUT_MS: 1200,
+    // A whole catalog record read off the UI thread, while other results already show.
+    CATALOG_READ_TIMEOUT_MS: 60_000,
     // Documents per index message when the page posts a source itself, one per frame.
     INDEX_CHUNK_SIZE: 2000,
     // Largest share of the free cache room one stored index may take.
@@ -193,6 +217,8 @@ export const CONFIG = {
     INITIAL_RESULTS: 200,       // first ranked results published per group
     EXPANSION_FACTOR: 5,        // grow retained results near a virtual window boundary
     RESULT_CAP: 50_000,         // final per-group cap after progressive expansion
+    DELIVERED_KEEP_FACTOR: 4,   // record items kept per shown result before a new epoch
+    DELIVERED_KEEP_MIN: 2_000,  // record items always kept per group
     HISTORY_MAX_ENTRIES: 10,    // recent searches kept
   },
 

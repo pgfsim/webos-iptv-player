@@ -90,15 +90,13 @@ function matchPrefixes(bytes: readonly number[], prefixes: readonly string[]): F
   return undecided ? 'undecided' : 'mismatch';
 }
 
-// Streams a response through onChunk, failing once it passes maxBytes, the
-// timeout, or the caller's signal.
-async function readLimited(
+export async function fetchLimitedText(
   url: string,
   maxBytes: number,
   timeout: number,
-  signal: AbortSignal | undefined,
-  onChunk: (bytes: Uint8Array) => void,
-): Promise<void> {
+  signal?: AbortSignal,
+  requiredPrefix?: string | readonly string[] | FetchPrefixValidator,
+): Promise<string> {
   const controller = new AbortController();
   let timedOut = false;
   const abort = () => controller.abort();
@@ -109,6 +107,27 @@ async function readLimited(
   const timer = setTimeout(onTimeout, timeout);
   if (signal?.aborted) abort();
   else signal?.addEventListener('abort', abort);
+
+  const validator = typeof requiredPrefix === 'function' ? requiredPrefix : null;
+  const prefixes: readonly string[] = typeof requiredPrefix === 'string'
+    ? [requiredPrefix]
+    : requiredPrefix === undefined || typeof requiredPrefix === 'function'
+      ? []
+      : requiredPrefix;
+  const prefixError = () => new FetchTextError(
+    'invalid_content',
+    validator
+      ? 'Response has an invalid opening'
+      : `Response does not begin with ${prefixes.join(' or ')}`,
+  );
+  const hasPrefixCheck = !!validator || prefixes.length > 0;
+  const prefixProbeLength = validator
+    ? 8192
+    : prefixes.reduce((n, p) => Math.max(n, p.length), 0) + UTF8_BOM.length;
+  const checkPrefix = (bytes: Uint8Array, complete: boolean): FetchPrefixVerdict =>
+    validator
+      ? validator(bytes, complete)
+      : matchPrefixes(Array.from(bytes), prefixes);
 
   let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
   let complete = false;
@@ -131,7 +150,11 @@ async function readLimited(
         'Response size cannot be bounded without a stream reader',
       );
     }
+
+    const chunks: Uint8Array[] = [];
     let length = 0;
+    const head: number[] = [];
+    let prefixSettled = !hasPrefixCheck;
     while (true) {
       const { done, value } = await reader.read();
       if (done) { complete = true; break; }
@@ -140,8 +163,29 @@ async function readLimited(
       if (length > maxBytes) {
         throw new FetchTextError('too_large', `Response exceeds ${maxBytes} bytes`);
       }
-      onChunk(value);
+      chunks.push(value);
+      if (!prefixSettled) {
+        for (let i = 0; i < value.length && head.length < prefixProbeLength; i++) {
+          head.push(value[i]);
+        }
+        const verdict = checkPrefix(new Uint8Array(head), false);
+        if (verdict === 'mismatch') throw prefixError();
+        if (verdict === 'match') prefixSettled = true;
+        if (verdict === 'undecided' && head.length === prefixProbeLength) {
+          throw prefixError();
+        }
+      }
     }
+    if (!prefixSettled
+        && checkPrefix(new Uint8Array(head), true) !== 'match') throw prefixError();
+
+    const bytes = new Uint8Array(length);
+    let offset = 0;
+    for (const chunk of chunks) {
+      bytes.set(chunk, offset);
+      offset += chunk.length;
+    }
+    return new TextDecoder().decode(bytes);
   } catch (err) {
     if (err instanceof FetchTextError) throw err;
     if (signal?.aborted) throw new FetchTextError('aborted', 'Request was cancelled');
@@ -152,83 +196,6 @@ async function readLimited(
     clearTimeout(timer);
     signal?.removeEventListener('abort', abort);
   }
-}
-
-export async function fetchLimitedText(
-  url: string,
-  maxBytes: number,
-  timeout: number,
-  signal?: AbortSignal,
-  requiredPrefix?: string | readonly string[] | FetchPrefixValidator,
-): Promise<string> {
-  const validator = typeof requiredPrefix === 'function' ? requiredPrefix : null;
-  const prefixes: readonly string[] = typeof requiredPrefix === 'string'
-    ? [requiredPrefix]
-    : requiredPrefix === undefined || typeof requiredPrefix === 'function'
-      ? []
-      : requiredPrefix;
-  const prefixError = () => new FetchTextError(
-    'invalid_content',
-    validator
-      ? 'Response has an invalid opening'
-      : `Response does not begin with ${prefixes.join(' or ')}`,
-  );
-  const hasPrefixCheck = !!validator || prefixes.length > 0;
-  const prefixProbeLength = validator
-    ? 8192
-    : prefixes.reduce((n, p) => Math.max(n, p.length), 0) + UTF8_BOM.length;
-  const checkPrefix = (bytes: Uint8Array, complete: boolean): FetchPrefixVerdict =>
-    validator
-      ? validator(bytes, complete)
-      : matchPrefixes(Array.from(bytes), prefixes);
-
-  const chunks: Uint8Array[] = [];
-  let length = 0;
-  const head: number[] = [];
-  let prefixSettled = !hasPrefixCheck;
-  await readLimited(url, maxBytes, timeout, signal, value => {
-    length += value.length;
-    chunks.push(value);
-    if (prefixSettled) return;
-    for (let i = 0; i < value.length && head.length < prefixProbeLength; i++) {
-      head.push(value[i]);
-    }
-    const verdict = checkPrefix(new Uint8Array(head), false);
-    if (verdict === 'mismatch') throw prefixError();
-    if (verdict === 'match') prefixSettled = true;
-    if (verdict === 'undecided' && head.length === prefixProbeLength) {
-      throw prefixError();
-    }
-  });
-  if (!prefixSettled
-      && checkPrefix(new Uint8Array(head), true) !== 'match') throw prefixError();
-
-  const bytes = new Uint8Array(length);
-  let offset = 0;
-  for (const chunk of chunks) {
-    bytes.set(chunk, offset);
-    offset += chunk.length;
-  }
-  return new TextDecoder().decode(bytes);
-}
-
-// Feeds a response to `onText` as decoded text pieces without keeping it, so
-// a caller that parses as it goes holds one network chunk at a time.
-export function fetchLimitedTextStream(
-  url: string,
-  maxBytes: number,
-  timeout: number,
-  signal: AbortSignal | undefined,
-  onText: (text: string) => void,
-): Promise<void> {
-  const decoder = new TextDecoder();
-  return readLimited(url, maxBytes, timeout, signal, value => {
-    const text = decoder.decode(value, { stream: true });
-    if (text) onText(text);
-  }).then(() => {
-    const rest = decoder.decode();
-    if (rest) onText(rest);
-  });
 }
 
 export async function fetchMaybeGzipText(url: string, timeout = 30000): Promise<string> {

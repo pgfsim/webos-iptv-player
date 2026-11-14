@@ -129,10 +129,6 @@ export const DE_MESSAGES = {
     one: '{count} Serie',
     other: '{count} Serien',
   },
-  'catalog.episodeCount': {
-    one: '{count} Folge',
-    other: '{count} Folgen',
-  },
   'catalog.noMovies': 'Für dieses Konto sind keine Filme verfügbar.',
   'catalog.noMoviesCategory': 'Keine Filme in dieser Kategorie.',
   'catalog.noSeries': 'Für dieses Konto sind keine Serien verfügbar.',
@@ -195,6 +191,8 @@ export const DE_MESSAGES = {
     other: 'Beginnt in {count} Sekunden',
   },
   'player.playNow': 'Jetzt abspielen',
+  'player.previousEpisode': 'Vorherige Folge',
+  'player.nextEpisode': 'Nächste Folge',
   'player.unableToPlay': 'Dieses Video kann nicht abgespielt werden.',
   'player.reconnecting': 'Verbindung wird wiederhergestellt…',
   'player.retryingCatchup': 'Replay wird erneut geladen…',
@@ -508,7 +506,6 @@ export const DE_MESSAGES = {
   'parental.askAfterLeaving': 'Nach Verlassen der App',
   'app.welcome': 'Willkommen! Fügen Sie zum Starten die URL einer Wiedergabeliste hinzu.',
   'app.loadingChannels': 'Sender werden geladen…',
-  'app.loadingChannelsProgress': 'Sender werden geladen… Verarbeitet: {processed}, übernommen: {kept}',
   'app.channelsLoaded': {
     one: '{count} Sender geladen',
     other: '{count} Sender geladen',

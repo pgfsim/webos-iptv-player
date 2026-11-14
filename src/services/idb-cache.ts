@@ -1,6 +1,7 @@
 import { CONFIG } from '../config';
 import type { Channel, EpgSource, ParsedEpg } from '../types';
 import { createLogger } from '../utils/logger';
+import { runAppWorkerTask } from '../workers/app-worker-client';
 import type { SearchIndexCandidate } from '../workers/tasks';
 import {
   CACHE_META_STORE as META_STORE,
@@ -18,7 +19,33 @@ import {
   transactionDone,
   type CacheStore,
 } from './idb-database';
+import {
+  heldRecord,
+  isSpentStandIn,
+  releaseHeldRecord,
+  withHeldValue,
+  type HeldRecord,
+} from './held-records';
 import { cacheEntryMetaId, cacheRecordTimestamp, PLAYLIST_CACHE_KEY } from './idb-schema';
+import { JSON_NULL_BYTES, serializedBytes } from '../utils/serialized-bytes';
+import { yieldToEventLoop } from '../utils/yield';
+import { packCatalog, readCatalogData } from './catalog-cache-codec';
+import {
+  type EpgFilterLists,
+  isPackedEpg,
+  packEpg,
+  packEpgFilter,
+  unpackEpgFilter,
+  unpackEpgSliced,
+} from './epg-cache-codec';
+import {
+  chunkedPlaylistWrites,
+  isPlaylistChunkKey,
+  playlistChunkChannels,
+  playlistChunkInfo,
+  playlistChunkKey,
+  playlistChunkRange,
+} from './playlist-chunks';
 
 const log = createLogger('CacheStorage');
 const CACHE_CATEGORIES = ['playlist', 'epg', 'catalog', 'subtitle', 'health', 'search'] as const;
@@ -44,7 +71,6 @@ const ENTRY_META_INDEX_KEY = 'entry-index';
 const ENTRY_META_VERSION = 1;
 const ACCESS_TOUCH_INTERVAL_MS = 60 * 60 * 1000;
 const STORAGE_ESTIMATE_TTL_MS = 60 * 1000;
-const JSON_NULL_BYTES = 4;
 
 export type CacheCategory = typeof CACHE_CATEGORIES[number];
 
@@ -100,9 +126,9 @@ export interface CacheUsageSummary {
   quotaBytes: number | null;
 }
 
-export interface CachedEpgFilter {
-  ids: string[];
-  names: string[];
+export interface CachedEpgFilter extends EpgFilterLists {
+  /** Fingerprint of the inputs the filter was built from. */
+  key?: string;
 }
 
 export interface CachedEpgEntry {
@@ -136,9 +162,14 @@ interface StreamMimeEntry {
 
 interface CachedPlaylistPayload {
   sourceSignature: string;
-  channels: Channel[];
+  // Absent once the channels moved to chunk records (`chunkCount`).
+  channels?: Channel[];
+  chunkCount?: number;
+  channelCount?: number;
   epgSources: EpgSource[];
   timestamp: number;
+  // Every playlist id the channels may carry, so a load can skip scanning them.
+  sourceIds?: string[];
 }
 
 type StoredRecord = Record<string, unknown> & CacheFields;
@@ -169,6 +200,7 @@ let scheduledPlaylist: {
   timestamp: number;
   refreshIntervalMs: number | null;
   sourceSignature: string;
+  sourceIds: string[] | undefined;
   scheduledAt: number;
 } | null = null;
 let playlistFrame: number | null = null;
@@ -191,9 +223,13 @@ function cancelPlaylistSchedule(): void {
   playlistTimer = null;
 }
 
-function discardScheduledPlaylist(reason: 'cache_clear' | 'rescheduled'): void {
+function discardScheduledPlaylist(
+  reason: 'cache_clear' | 'rescheduled',
+  next: Channel[] | null = null,
+): void {
   cancelPlaylistSchedule();
   if (scheduledPlaylist) {
+    if (scheduledPlaylist.channels !== next) releaseHeldRecord(scheduledPlaylist.channels);
     log.info(
       'Playlist cache write cancelled',
       'event=playlist.cache.write.cancelled',
@@ -224,6 +260,7 @@ function persistScheduledPlaylist(): void {
     pending.timestamp,
     pending.sourceSignature,
     pending.refreshIntervalMs,
+    pending.sourceIds,
   ).then((stored) => {
     if (stored) {
       for (const listener of playlistWriteListeners) listener();
@@ -299,12 +336,14 @@ export function scheduleCachedPlaylist(
   timestamp = Date.now(),
   refreshIntervalMs: number | null = CONFIG.DEFAULT_PLAYLIST_REFRESH_INTERVAL_MS,
   token: PlaylistCacheToken = playlistCacheToken(),
+  sourceIds?: string[],
 ): void {
   if (!channels.length) return;
   if (
     token.generation !== playlistGeneration
     || token.signature !== playlistSourceSignature()
   ) {
+    releaseHeldRecord(channels);
     log.info(
       'Playlist cache write skipped',
       'event=playlist.cache.write.skipped',
@@ -314,7 +353,7 @@ export function scheduleCachedPlaylist(
     );
     return;
   }
-  if (scheduledPlaylist) discardScheduledPlaylist('rescheduled');
+  if (scheduledPlaylist) discardScheduledPlaylist('rescheduled', channels);
   const scheduledAt = Date.now();
   scheduledPlaylist = {
     channels,
@@ -322,6 +361,7 @@ export function scheduleCachedPlaylist(
     timestamp,
     refreshIntervalMs,
     sourceSignature: token.signature,
+    sourceIds,
     scheduledAt,
   };
   cancelPlaylistSchedule();
@@ -380,87 +420,6 @@ function ttlFor(category: CacheCategory): number {
 
 const openDb = openPersistenceDb;
 
-function jsonStringBytes(value: string): number {
-  let bytes = 2;
-  for (let i = 0; i < value.length; i++) {
-    const code = value.charCodeAt(i);
-    if (code === 34 || code === 92 || code === 8 || code === 9
-        || code === 10 || code === 12 || code === 13) {
-      bytes += 2;
-    } else if (code < 32) {
-      bytes += 6;
-    } else if (code < 128) {
-      bytes++;
-    } else if (code < 2048) {
-      bytes += 2;
-    } else if (code >= 0xd800 && code <= 0xdbff
-        && i + 1 < value.length
-        && value.charCodeAt(i + 1) >= 0xdc00
-        && value.charCodeAt(i + 1) <= 0xdfff) {
-      bytes += 4;
-      i++;
-    } else {
-      bytes += 3;
-    }
-  }
-  return bytes;
-}
-
-function serializedBytes(value: unknown): number {
-  const ancestors = new WeakSet<object>();
-
-  const measure = (item: unknown, arrayItem: boolean): number => {
-    switch (typeof item) {
-      case 'string':
-        return jsonStringBytes(item);
-      case 'number':
-        return Number.isFinite(item) ? String(item).length : JSON_NULL_BYTES;
-      case 'boolean':
-        return item ? 4 : 5;
-      case 'bigint':
-        throw new TypeError('BigInt cannot be serialized to JSON');
-      case 'undefined':
-      case 'function':
-      case 'symbol':
-        return arrayItem ? JSON_NULL_BYTES : 0;
-      case 'object':
-        break;
-    }
-    if (item === null) return JSON_NULL_BYTES;
-    if (item instanceof Date) {
-      return Number.isFinite(item.getTime())
-        ? jsonStringBytes(item.toISOString())
-        : JSON_NULL_BYTES;
-    }
-    // Typed arrays are stored as their bytes, not as JSON numbers.
-    if (ArrayBuffer.isView(item)) return item.byteLength;
-    if (ancestors.has(item)) throw new TypeError('Circular cache value');
-    ancestors.add(item);
-    let bytes = 2;
-    let entries = 0;
-    if (Array.isArray(item)) {
-      for (let i = 0; i < item.length; i++) {
-        bytes += measure(item[i], true);
-        entries++;
-      }
-    } else {
-      const record = item as Record<string, unknown>;
-      for (const key in record) {
-        if (!Object.prototype.hasOwnProperty.call(record, key)) continue;
-        const field = record[key];
-        const valueBytes = measure(field, false);
-        if (!valueBytes) continue;
-        bytes += jsonStringBytes(key) + 1 + valueBytes;
-        entries++;
-      }
-    }
-    ancestors.delete(item);
-    return bytes + Math.max(0, entries - 1);
-  };
-
-  return measure(value, false);
-}
-
 function finiteNumber(value: unknown, fallback: number): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
 }
@@ -516,10 +475,23 @@ function isNormalizedRecord(store: CacheStore, raw: Record<string, unknown>): ra
     && raw.byteSize > 0;
 }
 
+/** A value the app worker holds, and where it goes in the record. */
+interface HeldSlot {
+  record: HeldRecord;
+  field: string;
+}
+
+// Null once the worker lost the value, so only the page's copy is left.
+async function heldBytes(record: HeldRecord): Promise<number | null> {
+  if (record.bytes !== undefined) return record.bytes;
+  return record.measure ? record.measure() : null;
+}
+
 function normalizeRecord(
   store: CacheStore,
   raw: Record<string, unknown>,
   now = Date.now(),
+  held: { field: string; bytes: number } | null = null,
 ): StoredRecord {
   const category = categoryForStore(store);
   const timestamp = finiteNumber(raw.timestamp, now);
@@ -537,7 +509,10 @@ function normalizeRecord(
     expiresAt,
     byteSize: 0,
   };
-  normalized.byteSize = serializedBytes(normalized);
+  // The worker already measured a held value; walking it here would stall.
+  normalized.byteSize = held
+    ? serializedBytes(withHeldValue(normalized, held.field, null)) - JSON_NULL_BYTES + held.bytes
+    : serializedBytes(normalized);
   return normalized;
 }
 
@@ -587,8 +562,18 @@ async function readRaw(store: CacheStore, key: IDBValidKey): Promise<StoredRecor
   }
 }
 
-async function touchRecord(store: CacheStore, record: StoredRecord): Promise<void> {
+function touchRecord(store: CacheStore, record: StoredRecord): Promise<void> {
   const key = record[cacheKeyPath(store)] as IDBValidKey;
+  return touchEntry(store, key, cacheRecordTimestamp(record), now => entryMeta(store, key, record, now));
+}
+
+// Without a record at hand, an entry missing its metadata stays untouched.
+async function touchEntry(
+  store: CacheStore,
+  key: IDBValidKey,
+  timestamp: number | undefined,
+  missing: ((now: number) => CacheEntryMeta) | null,
+): Promise<void> {
   const id = entryMetaId(store, key);
   const now = Date.now();
   const lastTouch = accessTouches.get(id);
@@ -603,11 +588,11 @@ async function touchRecord(store: CacheStore, record: StoredRecord): Promise<voi
     request.onsuccess = () => {
       const current: unknown = request.result;
       if (isCacheEntryMeta(current) && current.timestamp !== undefined) {
-        if (current.timestamp === cacheRecordTimestamp(record)) {
+        if (current.timestamp === timestamp) {
           metadata.put({ ...current, lastAccessedAt: now });
         }
-      } else {
-        metadata.put(entryMeta(store, key, record, now));
+      } else if (missing) {
+        metadata.put(missing(now));
       }
     };
     await transactionDone(tx);
@@ -640,6 +625,8 @@ async function rebuildMetadata(): Promise<void> {
   if (!db) return;
   const categories = emptyUsage();
   const entries: CacheEntryMeta[] = [];
+  // A playlist's chunks count toward its head entry, not as entries of their own.
+  const chunkBytes = new Map<string, number>();
   // Search indexes are disposable and too large to re-measure here, so a
   // rebuild drops them instead.
   const scanned = CACHE_STORES.filter(store => store !== SEARCH_INDEX_STORE);
@@ -655,6 +642,15 @@ async function rebuildMetadata(): Promise<void> {
           resolve();
           return;
         }
+        if (storeName === PLAYLIST_STORE && isPlaylistChunkKey(cursor.primaryKey)) {
+          const key = String(cursor.primaryKey);
+          const head = key.slice(0, key.indexOf('#'));
+          const bytes = serializedBytes(cursor.value);
+          categories[category].bytes += bytes;
+          chunkBytes.set(head, (chunkBytes.get(head) ?? 0) + bytes);
+          cursor.continue();
+          return;
+        }
         const record = normalizeRecord(storeName, cursor.value as Record<string, unknown>);
         categories[category].bytes += record.byteSize;
         categories[category].entries++;
@@ -664,6 +660,9 @@ async function rebuildMetadata(): Promise<void> {
       req.onerror = () => reject(req.error ?? new Error('Cache scan failed'));
     })));
     await done;
+    for (const entry of entries) {
+      if (entry.store === PLAYLIST_STORE) entry.byteSize += chunkBytes.get(String(entry.key)) ?? 0;
+    }
 
     const now = Date.now();
     const total = CACHE_CATEGORIES.reduce((sum, category) => ({
@@ -917,6 +916,10 @@ async function deleteCandidates(candidates: CacheCandidate[]): Promise<number> {
     const tx = db.transaction([...CACHE_STORES, META_STORE], 'readwrite');
     for (const candidate of candidates) {
       tx.objectStore(candidate.store).delete(candidate.key);
+      if (candidate.store === PLAYLIST_STORE && typeof candidate.key === 'string') {
+        const [lower, upper] = playlistChunkRange(candidate.key);
+        tx.objectStore(candidate.store).delete(IDBKeyRange.bound(lower, upper));
+      }
       tx.objectStore(META_STORE).delete(entryMetaId(candidate.store, candidate.key));
       accessTouches.delete(entryMetaId(candidate.store, candidate.key));
     }
@@ -1049,7 +1052,8 @@ async function commitRecord(
   store: CacheStore,
   record: StoredRecord,
   previous: CacheEntryMeta | null,
-): Promise<void> {
+  slot: HeldSlot | null = null,
+): Promise<boolean> {
   const db = await openDb();
   if (!db) throw new Error('IndexedDB unavailable');
   const metadata = await readMetadata();
@@ -1058,22 +1062,49 @@ async function commitRecord(
   const deltaEntries = previous ? 0 : 1;
   const categoryUsage = metadata.categories[category];
   const now = Date.now();
-  const tx = db.transaction([store, META_STORE], 'readwrite');
-  tx.objectStore(store).put(record);
   const key = record[cacheKeyPath(store)] as IDBValidKey;
-  tx.objectStore(META_STORE).put(entryMeta(store, key, record));
-  tx.objectStore(META_STORE).put({
+  const meta: CacheMeta[] = [{
     category,
     bytes: Math.max(0, categoryUsage.bytes + deltaBytes),
     entries: Math.max(0, categoryUsage.entries + deltaEntries),
     updatedAt: now,
-  } satisfies CacheMeta);
-  tx.objectStore(META_STORE).put({
+  }, {
     category: 'total',
     bytes: Math.max(0, metadata.total.bytes + deltaBytes),
     entries: Math.max(0, metadata.total.entries + deltaEntries),
     updatedAt: now,
-  } satisfies CacheMeta);
+  }];
+  const chunked = isChunkedWrite(store, record, slot);
+  if (slot) {
+    const held = slot.record;
+    const result = await held.write({
+      field: slot.field,
+      ...(chunked ? { chunkKeyPath: cacheKeyPath(store) } : {}),
+      writes: [
+        { store, value: withHeldValue(record, slot.field, null) },
+        { store: META_STORE, value: { ...entryMeta(store, key, record) } },
+        ...meta.map(value => ({ store: META_STORE, value: { ...value } })),
+      ],
+    });
+    if (result === 'written') return true;
+    if (result === 'quota_exceeded') throw new DOMException('Cache quota exceeded', 'QuotaExceededError');
+    if (result === 'failed') throw new Error('Worker cache write failed');
+    if (held.detached) throw new Error('Worker lost the value to cache');
+    return false;
+  }
+  const tx = db.transaction([store, META_STORE], 'readwrite');
+  if (chunked) {
+    for (const write of chunkedPlaylistWrites(store, record, cacheKeyPath(store))) {
+      if (write.deleteRange) {
+        tx.objectStore(store).delete(IDBKeyRange.bound(write.deleteRange[0], write.deleteRange[1]));
+      }
+      if (write.value) tx.objectStore(store).put(write.value);
+    }
+  } else {
+    tx.objectStore(store).put(record);
+  }
+  tx.objectStore(META_STORE).put(entryMeta(store, key, record));
+  for (const value of meta) tx.objectStore(META_STORE).put(value);
   await transactionDone(tx, (error) => {
     if (store === CATALOG_STORE) {
       log.warn(
@@ -1085,12 +1116,52 @@ async function commitRecord(
       );
     }
   });
+  return true;
+}
+
+// A playlist write that carries its channels stores them as chunk records.
+function isChunkedWrite(store: CacheStore, record: StoredRecord, slot: HeldSlot | null): boolean {
+  if (store !== PLAYLIST_STORE) return false;
+  if (slot) return slot.field === 'data.channels';
+  const data = record.data as { channels?: unknown } | undefined;
+  return Array.isArray(data?.channels);
+}
+
+// The page then pays the clone the worker was holding the value to spare it.
+function logHeldFallback(store: CacheStore, stage: 'measure' | 'write', outcome: 'page' | 'skipped'): void {
+  log.warn(
+    'Worker no longer holds the value to cache',
+    'event=persistence.cache.held.fallback',
+    `stage=${stage}`,
+    `category=${categoryForStore(store)}`,
+    `outcome=${outcome}`,
+  );
+}
+
+// A restarted worker lost the value, so the page writes its own copy,
+// measured afresh since the page may have changed it after the worker did.
+// The slot is cleared then, so a quota retry skips the worker.
+async function commitWithFallback(
+  store: CacheStore,
+  key: IDBValidKey,
+  record: StoredRecord,
+  target: { held: HeldSlot | null },
+): Promise<void> {
+  if (await commitRecord(store, record, await readEntryMeta(store, key), target.held)) return;
+  logHeldFallback(store, 'write', 'page');
+  target.held = null;
+  const measured = record.byteSize;
+  record.byteSize = 0;
+  record.byteSize = serializedBytes(record);
+  await ensureCapacity(record.byteSize - measured);
+  await commitRecord(store, record, await readEntryMeta(store, key));
 }
 
 async function putRawNow(
   store: CacheStore,
   raw: Record<string, unknown>,
   allowQuotaRetry = true,
+  slot: HeldSlot | null = null,
 ): Promise<boolean> {
   const key = raw[cacheKeyPath(store)] as IDBValidKey | undefined;
   if (key === undefined || key === null) return false;
@@ -1106,13 +1177,24 @@ async function putRawNow(
     return false;
   }
   await ensureMetadata();
+  let held = slot;
+  const bytes = held ? await heldBytes(held.record) : null;
+  if (held && bytes === null) {
+    logHeldFallback(store, 'measure', held.record.detached ? 'skipped' : 'page');
+    if (held.record.detached) return false;
+    held = null;
+  }
   const previous = await readEntryMeta(store, key);
-  const record = normalizeRecord(store, raw);
-  const category = categoryForStore(store);
+  const record = normalizeRecord(
+    store,
+    raw,
+    Date.now(),
+    held && bytes !== null ? { field: held.field, bytes } : null,
+  );
   await ensureCapacity(Math.max(0, record.byteSize - (previous?.byteSize ?? 0)));
+  const target = { held };
   try {
-    const latest = await readEntryMeta(store, key);
-    await commitRecord(store, record, latest);
+    await commitWithFallback(store, key, record, target);
     return true;
   } catch (err) {
     if (allowQuotaRetry && isQuotaError(err)) {
@@ -1123,10 +1205,9 @@ async function putRawNow(
         `category=${categoryForStore(store)}`,
         `recordBytes=${record.byteSize}`,
       );
-      await pruneBytes(record.byteSize + CLEANUP_MARGIN_BYTES, EVICTION_ORDER, category);
+      await pruneBytes(record.byteSize + CLEANUP_MARGIN_BYTES, EVICTION_ORDER, categoryForStore(store));
       try {
-        const latest = await readEntryMeta(store, key);
-        await commitRecord(store, record, latest);
+        await commitWithFallback(store, key, record, target);
         return true;
       } catch (retryErr) {
         if (store === CATALOG_STORE) {
@@ -1176,8 +1257,9 @@ function putRaw(
   store: CacheStore,
   raw: Record<string, unknown>,
   allowQuotaRetry = true,
+  held: HeldSlot | null = null,
 ): Promise<boolean> {
-  return enqueueMutation(() => putRawNow(store, raw, allowQuotaRetry));
+  return enqueueMutation(() => putRawNow(store, raw, allowQuotaRetry, held));
 }
 
 async function readRawWithoutTouch(
@@ -1298,8 +1380,10 @@ export async function getCachedEpg(url: string): Promise<CachedEpgEntry | null> 
   return {
     url,
     timestamp: cacheRecordTimestamp(raw),
-    data: raw.data as ParsedEpg,
-    filter: raw.filter as CachedEpgFilter | null | undefined,
+    data: isPackedEpg(raw.data)
+      ? await unpackEpgSliced(raw.data, yieldToEventLoop, CONFIG.EPG.CACHE_DECODE_SLICE_MS)
+      : raw.data as ParsedEpg,
+    filter: unpackEpgFilter(raw.filter),
   };
 }
 
@@ -1310,13 +1394,19 @@ export async function setCachedEpg(
   timestamp = Date.now(),
   refreshIntervalMs: number | null = CONFIG.DEFAULT_EPG_REFRESH_INTERVAL_MS,
 ): Promise<boolean> {
-  return putRaw(EPG_STORE, {
-    url,
-    timestamp,
-    data,
-    filter,
-    expiresAt: refreshIntervalMs === null ? null : timestamp + refreshIntervalMs,
-  });
+  const held = heldRecord(data);
+  try {
+    return await putRaw(EPG_STORE, {
+      url,
+      timestamp,
+      // The worker packs its own copy; a page fallback writes this one as is.
+      data: held ? data : packEpg(data),
+      filter: filter ? packEpgFilter(filter) : filter,
+      expiresAt: refreshIntervalMs === null ? null : timestamp + refreshIntervalMs,
+    }, true, held && { record: held, field: 'data' });
+  } finally {
+    held?.release();
+  }
 }
 
 export async function clearCachedEpg(): Promise<void> {
@@ -1360,11 +1450,13 @@ export async function getCachedCatalog<T = unknown>(
   const metadata = await readCatalogMetadata(key);
   const state = (metadata?.timestamp === timestamp ? catalogListState(metadata.state) : undefined)
     ?? catalogListState(raw.state);
-  rememberRecord(raw.data, { store: CATALOG_STORE, key, timestamp });
+  // Fork: stored by column to fit the quota.
+  const data = readCatalogData(raw.data);
+  rememberRecord(data, { store: CATALOG_STORE, key, timestamp });
   return {
     key,
     timestamp,
-    data: raw.data as T,
+    data: data as T,
     ...(state ? { state } : {}),
   };
 }
@@ -1376,6 +1468,8 @@ export async function getCachedCatalogMetadata(key: string): Promise<CachedCatal
     const cached = await getCachedCatalog(key);
     return cached ? { timestamp: cached.timestamp, ...(cached.state ? { state: cached.state } : {}) } : null;
   }
+  // The worker reads the record by reference, so this read is its use.
+  void touchEntry(CATALOG_STORE, key, metadata.timestamp, null);
   const state = catalogListState(metadata.state);
   return { timestamp: metadata.timestamp, ...(state ? { state } : {}) };
 }
@@ -1397,16 +1491,26 @@ export async function setCachedCatalog(
   data: unknown,
   ttlMs: number | null = CONFIG.XTREAM.DEFAULT_CATALOG_REFRESH_INTERVAL_MS,
   state?: CatalogListState,
-): Promise<void> {
+): Promise<number | null> {
+  if (isSpentStandIn(data)) return null;
   const timestamp = Date.now();
-  const stored = await putRaw(CATALOG_STORE, {
-    key,
-    timestamp,
-    data,
-    ...(state ? { state } : {}),
-    expiresAt: ttlMs === null ? null : timestamp + ttlMs,
-  });
-  if (stored) rememberRecord(data, { store: CATALOG_STORE, key, timestamp });
+  const held = heldRecord(data);
+  let stored = false;
+  try {
+    stored = await putRaw(CATALOG_STORE, {
+      key,
+      timestamp,
+      // Fork: the worker packs its own copy; a page write packs this one.
+      data: held ? data : packCatalog(data),
+      ...(state ? { state } : {}),
+      expiresAt: ttlMs === null ? null : timestamp + ttlMs,
+    }, true, held && { record: held, field: 'data' });
+  } finally {
+    held?.release();
+  }
+  if (!stored) return null;
+  rememberRecord(data, { store: CATALOG_STORE, key, timestamp });
+  return timestamp;
 }
 
 export function setCachedCatalogState(
@@ -1615,33 +1719,182 @@ export async function clearCachedChannelHealth(): Promise<void> {
   await clearStore(CHANNEL_HEALTH_STORE);
 }
 
+export interface CachedPlaylist {
+  epgSources: EpgSource[];
+  timestamp: number;
+  sourceIds?: string[];
+  channelCount: number;
+  /**
+   * Reads the channels a chunk at a time, each in its own task, handing each
+   * to `onChunk`; one returning false stops the read. Null when it stopped,
+   * or a chunk is missing or from another write.
+   */
+  readChannels(onChunk?: (chunk: Channel[]) => boolean | void): Promise<Channel[] | null>;
+}
+
+export async function openCachedPlaylist(
+  refreshIntervalMs: number | null = CONFIG.DEFAULT_PLAYLIST_REFRESH_INTERVAL_MS,
+): Promise<CachedPlaylist | null> {
+  const generation = playlistGeneration;
+  const raw = await readRaw(PLAYLIST_STORE, PLAYLIST_CACHE_KEY);
+  if (!raw) return null;
+  const payload = raw.data as CachedPlaylistPayload | undefined;
+  const timestamp = cacheRecordTimestamp(raw);
+  if (
+    payload?.sourceSignature !== playlistSourceSignature()
+    || (refreshIntervalMs !== null && Date.now() - timestamp >= refreshIntervalMs)
+  ) {
+    return null;
+  }
+  const ref: CacheRecordRef = { store: PLAYLIST_STORE, key: PLAYLIST_CACHE_KEY, timestamp };
+  void dropOldPlaylists();
+  const info = playlistChunkInfo(payload);
+  const legacy = payload.channels;
+  if (!info && !legacy?.length) return null;
+  if (info && !info.channelCount) return null;
+  const head = {
+    epgSources: payload.epgSources ?? [],
+    timestamp,
+    sourceIds: payload.sourceIds,
+  };
+  // TODO(cleanup, post-1.18.0): remove this legacy read with migrateLegacyPlaylistCache.
+  if (!info) {
+    const legacyChannels = legacy as Channel[];
+    return {
+      ...head,
+      channelCount: legacyChannels.length,
+      readChannels: (onChunk) => {
+        if (onChunk?.(legacyChannels) === false) return Promise.resolve(null);
+        rememberRecord(legacyChannels, ref);
+        // An expired cache is about to be replaced by the overdue refresh.
+        if (raw.expiresAt === null || raw.expiresAt > Date.now()) scheduleLegacyPlaylistMigration();
+        return Promise.resolve(legacyChannels);
+      },
+    };
+  }
+  return {
+    ...head,
+    channelCount: info.channelCount,
+    readChannels: async (onChunk) => {
+      const channels: Channel[] = [];
+      let next = readPlaylistChunk(0, raw.timestamp);
+      for (let index = 0; index < info.chunkCount; index++) {
+        const chunk = await next;
+        // The next read runs while this chunk is handed over.
+        if (index + 1 < info.chunkCount) next = readPlaylistChunk(index + 1, raw.timestamp);
+        if (!chunk) {
+          logChunkMissing(generation === playlistGeneration ? 'chunk_missing' : 'cleared', index, info.chunkCount);
+          return null;
+        }
+        for (const channel of chunk) channels.push(channel);
+        if (onChunk?.(chunk) === false) return null;
+      }
+      if (channels.length !== info.channelCount) {
+        logChunkMissing('chunk_missing', info.chunkCount, info.chunkCount);
+        return null;
+      }
+      rememberRecord(channels, ref);
+      return channels;
+    },
+  };
+}
+
+let legacyPlaylistMigration: ReturnType<typeof setTimeout> | null = null;
+
+// After the launch it slowed, so the worker's rewrite doesn't hold up the next.
+function scheduleLegacyPlaylistMigration(): void {
+  if (legacyPlaylistMigration !== null) return;
+  legacyPlaylistMigration = setTimeout(() => {
+    void migrateLegacyPlaylistCache().then(() => { legacyPlaylistMigration = null; });
+  }, CONFIG.PLAYLIST_CACHE_WRITE_DELAY_MS);
+}
+
+// TODO(cleanup, post-1.18.0): once releases before chunked playlist caches
+// are gone, remove this migration, scheduleLegacyPlaylistMigration, the
+// legacy read in openCachedPlaylist, the worker's `cache.migrate-playlist`
+// task and `migratePlaylist`, and their tests.
+// The worker reads and rewrites the record itself, keeping its timestamp,
+// expiry, and accounting, so the page pays no clone for it.
+export function migrateLegacyPlaylistCache(): Promise<void> {
+  return enqueueMutation(async () => {
+    try {
+      const chunks = await runAppWorkerTask('cache.migrate-playlist', {
+        key: PLAYLIST_CACHE_KEY,
+        keyPath: cacheKeyPath(PLAYLIST_STORE),
+        timeoutMs: CONFIG.XTREAM.HELD_WRITE_TIMEOUT_MS,
+      });
+      if (chunks === null) return;
+      log.info(
+        'Legacy playlist cache migration completed',
+        'event=persistence.cache.migration.completed',
+        'operation=migrate',
+        'category=playlist',
+        `records=${String(chunks)}`,
+      );
+    } catch (err) {
+      log.warn(
+        'Legacy playlist cache migration failed',
+        'event=persistence.cache.migration.failed',
+        'operation=migrate',
+        'category=playlist',
+        err,
+      );
+    }
+  });
+}
+
+async function readPlaylistChunk(index: number, timestamp: unknown): Promise<Channel[] | null> {
+  const db = await openDb();
+  if (!db) return null;
+  try {
+    const tx = db.transaction(PLAYLIST_STORE, 'readonly');
+    const chunk = await requestResult(
+      tx.objectStore(PLAYLIST_STORE).get(playlistChunkKey(PLAYLIST_CACHE_KEY, index)),
+    );
+    return playlistChunkChannels(chunk, timestamp) as Channel[] | null;
+  } catch {
+    return null;
+  }
+}
+
+// `cleared`: the cache was cleared while it was read.
+function logChunkMissing(reason: 'chunk_missing' | 'cleared', index: number, chunks: number): void {
+  log.warn(
+    'Cached playlist chunk is missing',
+    'event=playlist.cache.read.failed',
+    `reason=${reason}`,
+    `chunk=${String(index)}`,
+    `chunks=${String(chunks)}`,
+  );
+}
+
+// A channel list stored under an older key is never read again, and no size
+// pass removes channel lists, so it would hold its space for good.
+function dropOldPlaylists(): Promise<number> {
+  return enqueueMutation(async () => {
+    const old = (await collectCandidates())
+      .filter((item) => item.store === PLAYLIST_STORE && item.key !== PLAYLIST_CACHE_KEY);
+    return deleteCandidates(old);
+  }).catch(() => 0);
+}
+
 export async function getCachedPlaylist(
   refreshIntervalMs: number | null = CONFIG.DEFAULT_PLAYLIST_REFRESH_INTERVAL_MS,
 ): Promise<{
   channels: Channel[];
   epgSources: EpgSource[];
   timestamp: number;
+  sourceIds?: string[];
 } | null> {
-  const raw = await readRaw(PLAYLIST_STORE, PLAYLIST_CACHE_KEY);
-  if (raw) {
-    const payload = raw.data as CachedPlaylistPayload | undefined;
-    const timestamp = cacheRecordTimestamp(raw);
-    if (
-      payload?.sourceSignature === playlistSourceSignature()
-      && payload.channels?.length
-      && (refreshIntervalMs === null || Date.now() - timestamp < refreshIntervalMs)
-    ) {
-      rememberRecord(payload.channels, { store: PLAYLIST_STORE, key: PLAYLIST_CACHE_KEY, timestamp });
-      void dropOldPlaylists();
-      return {
-        channels: payload.channels,
-        epgSources: payload.epgSources ?? [],
-        timestamp,
-      };
-    }
-  }
-
-  return null;
+  const cached = await openCachedPlaylist(refreshIntervalMs);
+  const channels = cached && await cached.readChannels();
+  if (!cached || !channels) return null;
+  return {
+    channels,
+    epgSources: cached.epgSources,
+    timestamp: cached.timestamp,
+    sourceIds: cached.sourceIds,
+  };
 }
 
 export async function setCachedPlaylist(
@@ -1665,8 +1918,13 @@ function setCachedPlaylistWithSignature(
   timestamp: number,
   sourceSignature: string,
   refreshIntervalMs: number | null,
+  sourceIds?: string[],
 ): Promise<boolean> {
-  if (!channels.length) return Promise.resolve(false);
+  const held = heldRecord(channels);
+  if (!channels.length) {
+    held?.release();
+    return Promise.resolve(false);
+  }
   return putRaw(PLAYLIST_STORE, {
     key: PLAYLIST_CACHE_KEY,
     timestamp,
@@ -1675,25 +1933,20 @@ function setCachedPlaylistWithSignature(
       channels,
       epgSources,
       timestamp,
+      ...(sourceIds ? { sourceIds } : {}),
     } satisfies CachedPlaylistPayload,
     expiresAt: refreshIntervalMs === null ? null : timestamp + refreshIntervalMs,
-  }).then((stored) => {
+  }, true, held && { record: held, field: 'data.channels' }).then((stored) => {
+    held?.release();
     if (stored) {
       rememberRecord(channels, { store: PLAYLIST_STORE, key: PLAYLIST_CACHE_KEY, timestamp });
       void dropOldPlaylists();
     }
     return stored;
+  }, (error: unknown) => {
+    held?.release();
+    throw error;
   });
-}
-
-// A channel list stored under an older key is never read again, and no size
-// pass removes channel lists, so it would hold its space for good.
-function dropOldPlaylists(): Promise<number> {
-  return enqueueMutation(async () => {
-    const old = (await collectCandidates())
-      .filter((item) => item.store === PLAYLIST_STORE && item.key !== PLAYLIST_CACHE_KEY);
-    return deleteCandidates(old);
-  }).catch(() => 0);
 }
 
 export async function clearCachedPlaylist(): Promise<void> {

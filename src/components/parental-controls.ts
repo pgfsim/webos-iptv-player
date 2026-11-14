@@ -33,7 +33,10 @@ import {
   loadSeriesCategories,
   loadVodCategories,
   loadVodStreams,
+  syncAllSeries,
+  syncAllVodStreams,
 } from '../services/xtream-catalog';
+import { runAppWorkerTask } from '../workers/app-worker-client';
 import { ParentalControlService, liveParentalRequest, parentalTargetKey } from '../services/parental-control';
 import { t, tp } from '../i18n';
 import { createLogger } from '../utils/logger';
@@ -429,6 +432,12 @@ export class ParentalControls {
     if (index >= 0 && index !== this.sourceIndex) void this.selectSource(index);
   }
 
+  // A load that finished while this view was open brings the groups it lacked.
+  refreshChannels(): void {
+    if (this.sources[this.sourceIndex]?.kind !== 'live') return;
+    void this.selectSource(this.sourceIndex);
+  }
+
   private async selectSource(index: number, focusGroups = false): Promise<void> {
     const source = this.sources[index];
     if (!source) return;
@@ -499,27 +508,28 @@ export class ParentalControls {
   }
 
   // Catalog item rules don't record their category, so map them through the
-  // full catalog, which is fetched only when the account has item rules.
+  // catalog, which is read only when the account has item rules: the worker
+  // looks up just the ruled items, or the full list loads here without one.
   private async mapCatalogMembers(source: SourceEntry, signal: AbortSignal): Promise<void> {
-    const prefix = parentalTargetKey({
-      kind: source.kind === 'vod' ? 'vod-item' : 'series-item',
-      accountId: source.account.id,
-      itemId: '',
-    });
-    if (!ParentalControlService.itemRuleEntries().some(([key]) => key.startsWith(prefix))) return;
+    const kind = source.kind === 'vod' ? 'vod-item' : 'series-item';
+    const accountId = source.account.id;
+    const prefix = parentalTargetKey({ kind, accountId, itemId: '' });
+    const ids = ParentalControlService.itemRuleEntries()
+      .filter(([key]) => key.startsWith(prefix))
+      .map(([key]) => decodeURIComponent(key.slice(prefix.length)));
+    if (!ids.length) return;
     try {
-      const table = source.kind === 'vod'
-        ? await loadAllVodStreams(source.account, signal)
-        : await loadAllSeries(source.account, signal);
+      const members = await this.ruledMembers(source, ids, signal)
+        ?? (source.kind === 'vod'
+          ? (await loadAllVodStreams(source.account, signal))
+            .map((item): [string, string] => [item.streamId, item.categoryId])
+          : (await loadAllSeries(source.account, signal))
+            .map((item): [string, string] => [item.seriesId, item.categoryId]));
       if (signal.aborted) return;
-      for (let i = 0; i < table.length; i++) {
-        const item = table.item(i)!;
-        const entry = source.kind === 'vod'
-          ? this.vodItem(item as VodItem)
-          : this.seriesItem(item as SeriesItem);
-        const key = ruleKey(entry);
+      for (const [itemId, categoryId] of members) {
+        const key = parentalTargetKey({ kind, accountId, itemId });
         if (!this.memberGroups.has(key)) {
-          this.setMemberGroup(key, `${source.kind}:${source.account.id}:${item.categoryId}`);
+          this.setMemberGroup(key, `${source.kind}:${source.account.id}:${categoryId}`);
         }
       }
       this.render();
@@ -528,6 +538,28 @@ export class ParentalControls {
         log.error('Parental catalog mapping failed', 'event=parental.manager.load.failed',
           'stage=mapping', `source=${source.key}`, err);
       }
+    }
+  }
+
+  // null: no worker holds the catalog record, so the caller loads the list.
+  private async ruledMembers(
+    source: SourceEntry,
+    ids: string[],
+    signal: AbortSignal,
+  ): Promise<Array<[string, string]> | null> {
+    const record = source.kind === 'vod'
+      ? await syncAllVodStreams(source.account, signal)
+      : await syncAllSeries(source.account, signal);
+    if (!record || signal.aborted) return null;
+    try {
+      const response = await runAppWorkerTask('catalog.members', {
+        record,
+        idField: source.kind === 'vod' ? 'streamId' : 'seriesId',
+        ids,
+      });
+      return response ? response.members : null;
+    } catch {
+      return null;
     }
   }
 

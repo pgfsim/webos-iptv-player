@@ -129,10 +129,6 @@ export const ES_MESSAGES = {
     one: '{count} serie',
     other: '{count} series',
   },
-  'catalog.episodeCount': {
-    one: '{count} episodio',
-    other: '{count} episodios',
-  },
   'catalog.noMovies': 'No hay películas disponibles para esta cuenta.',
   'catalog.noMoviesCategory': 'No hay películas en esta categoría.',
   'catalog.noSeries': 'No hay series disponibles para esta cuenta.',
@@ -195,6 +191,8 @@ export const ES_MESSAGES = {
     other: 'Comienza en {count} segundos',
   },
   'player.playNow': 'Reproducir ahora',
+  'player.previousEpisode': 'Episodio anterior',
+  'player.nextEpisode': 'Siguiente episodio',
   'player.unableToPlay': 'No se puede reproducir este video.',
   'player.reconnecting': 'Reconectando…',
   'player.retryingCatchup': 'Reintentando la reproducción en catch-up…',
@@ -508,7 +506,6 @@ export const ES_MESSAGES = {
   'parental.askAfterLeaving': 'Al salir de la app',
   'app.welcome': '¡Bienvenido! Agrega la URL de una lista para comenzar.',
   'app.loadingChannels': 'Cargando canales…',
-  'app.loadingChannelsProgress': 'Cargando canales… Entradas procesadas: {processed}; conservadas: {kept}',
   'app.channelsLoaded': {
     one: '{count} canal cargado',
     other: '{count} canales cargados',

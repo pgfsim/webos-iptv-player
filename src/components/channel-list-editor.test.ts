@@ -25,6 +25,7 @@ const { data, customization, playlistMock, epgMock, storageMock, recentMock, toa
     customization,
     playlistMock: {
       channels,
+      complete: true,
       groupsRevision: 0,
       playlistTabs: [] as { id: string; name: string }[],
       getGroupsForPlaylist: () => ['News', 'Sports'],
@@ -41,6 +42,7 @@ const { data, customization, playlistMock, epgMock, storageMock, recentMock, toa
     epgMock: {
       mappingRevision: 0,
       programmes: {} as Record<string, unknown[]>,
+      getProgrammes(id: string) { return this.programmes[id] ?? null; },
       findChannelId: vi.fn(() => null as string | null),
       getSourceOffsetMinutes: vi.fn(() => 0),
       getNowPlaying: () => null,
@@ -248,6 +250,39 @@ describe('ChannelList edit mode', () => {
     list.render();
     list.handleAction('yellow');
   }
+
+  it('waits for the whole channel list before editing it', () => {
+    Object.assign(playlistMock, { complete: false });
+    try {
+      enterEdit();
+      expect(list.isEditing).toBe(false);
+      expect(toastMock.showToast).toHaveBeenLastCalledWith('Loading channels…');
+    } finally {
+      Object.assign(playlistMock, { complete: true });
+    }
+    enterEdit();
+    expect(list.isEditing).toBe(true);
+  });
+
+  it('still waits for the whole list when a PIN entered during the load lets editing in', () => {
+    let proceed: (() => void) | null = null;
+    list = new ChannelList(container, {
+      onChannelSelect: onSelect,
+      onChannelsChanged: vi.fn(),
+      onEpgMappingChanged,
+      onEpgOffsetChanged,
+      authorizeEdit: next => { proceed = next; },
+    });
+    enterEdit();
+    Object.assign(playlistMock, { complete: false });
+    try {
+      proceed!();
+      expect(list.isEditing).toBe(false);
+      expect(toastMock.showToast).toHaveBeenLastCalledWith('Loading channels…');
+    } finally {
+      Object.assign(playlistMock, { complete: true });
+    }
+  });
 
   it('yellow enters edit mode and yellow again leaves it', () => {
     enterEdit();

@@ -5,24 +5,32 @@ import {
   type XMLTVRecordSink,
 } from './xmltv-parser';
 import { runAppWorkerTask } from '../workers/app-worker-client';
+import { holdEpg } from '../workers/held-values';
+import { PACKED_EPG_FORMAT, packEpg, unpackEpgSliced } from '../services/epg-cache-codec';
+import { holdWorkerValue } from '../services/worker-held-records';
+import { releaseHeldRecord } from '../services/held-records';
 import type {
   XMLTVWorkerChunk,
   XMLTVWorkerRequest,
   XMLTVWorkerResponse,
 } from '../workers/tasks';
 import type { EpgChannel, ParsedEpg, Programme } from '../types';
+import { CONFIG } from '../config';
 import { createLogger } from '../utils/logger';
+import { yieldToEventLoop } from '../utils/yield';
 
 export type XMLTVLoadResult = XMLTVWorkerResponse;
 const log = createLogger('XMLTVLoad');
-const CHANNEL_BATCH_SIZE = 128;
-const PROGRAMME_BATCH_SIZE = 256;
+// Each message is one short clone on the page; the whole guide at once
+// would be one long task there.
+const GUIDE_MESSAGE_CHARS = 1024 * 1024;
 const PROGRESS_INTERVAL_BYTES = 8 * 1024 * 1024;
 
 export async function fetchAndParseXMLTV(
   url: string,
   timeout = 30000,
   options: XMLTVParseOptions = {},
+  holdForCache = false,
 ): Promise<XMLTVLoadResult> {
   const started = Date.now();
   log.info(
@@ -32,8 +40,9 @@ export async function fetchAndParseXMLTV(
     `items=${String(options.channelIds?.size ?? options.channelNames?.size ?? 0)}`,
     `timeoutMs=${String(timeout)}`,
   );
+  let decodeFailed = false;
   try {
-    const accumulator = new XMLTVAccumulator();
+    const blocks: Record<'channels' | 'programmes', string[]> = { channels: [], programmes: [] };
     const result = await runAppWorkerTask('xmltv.load', {
       url,
       timeout,
@@ -44,6 +53,7 @@ export async function fetchAndParseXMLTV(
         retainChannelCatalog: options.retainChannelCatalog,
         maxProgrammes: options.maxProgrammes,
       },
+      ...(holdForCache ? { holdForCache } : {}),
     }, chunk => {
       if (chunk.kind === 'progress') {
         log.info(
@@ -56,13 +66,48 @@ export async function fetchAndParseXMLTV(
         );
         return;
       }
-      accumulator.accept(chunk);
+      for (const block of chunk.blocks) blocks[chunk.part].push(block);
     });
-    result.data = accumulator.complete(result.data);
     if (result.metrics.attempts > 1) logRetry();
-    logCompleted(result);
+    const data = result.data;
+    // Held before the decode: holding retains the worker, which would
+    // otherwise stop idle while the page decodes, and lose the guide.
+    if (result.held) {
+      holdWorkerValue(data, result.held, false);
+      delete result.held;
+    }
+    const decodeStarted = Date.now();
+    try {
+      const guide = await unpackEpgSliced(
+        { format: PACKED_EPG_FORMAT, meta: {}, ...blocks },
+        yieldToEventLoop,
+        CONFIG.EPG.CACHE_DECODE_SLICE_MS,
+      );
+      data.channels = guide.channels;
+      data.programmes = guide.programmes;
+    } catch (error) {
+      decodeFailed = true;
+      releaseHeldRecord(data);
+      const { metrics } = result;
+      log.error(
+        'XMLTV guide decode failed',
+        'event=epg.xmltv.load.failed',
+        'stage=decode',
+        'reason=exception',
+        `attempts=${String(metrics.attempts)}`,
+        `transport=${metrics.transport}`,
+        `encoding=${metrics.encoding}`,
+        `bytes=${String(metrics.inputBytes)}`,
+        `chunks=${String(metrics.chunks)}`,
+        `elapsedMs=${String(Date.now() - started)}`,
+        error,
+      );
+      throw error;
+    }
+    logCompleted(result, Date.now() - decodeStarted, Date.now() - started);
     return result;
   } catch (error) {
+    if (decodeFailed) throw error;
     const details = workerFailureDetails(error);
     if (details?.retried) logRetry();
     if (details) {
@@ -101,7 +146,7 @@ function logRetry(): void {
   );
 }
 
-function logCompleted(result: XMLTVWorkerResponse): void {
+function logCompleted(result: XMLTVWorkerResponse, decodeMs: number, totalMs: number): void {
   const { metrics } = result;
   log.info(
     'XMLTV stream loaded',
@@ -114,6 +159,8 @@ function logCompleted(result: XMLTVWorkerResponse): void {
     `programmes=${String(result.stats.programmesKept)}`,
     `dropped=${String(result.stats.droppedBudget)}`,
     `elapsedMs=${String(metrics.elapsedMs)}`,
+    `decodeMs=${String(decodeMs)}`,
+    `totalMs=${String(totalMs)}`,
   );
 }
 
@@ -179,11 +226,11 @@ class XMLTVWorkerError extends Error {
 
 export async function fetchAndParseXMLTVInWorker(
   request: XMLTVWorkerRequest,
-  emitChunk?: (chunk: XMLTVWorkerChunk) => void,
+  emitChunk: (chunk: XMLTVWorkerChunk) => void,
 ): Promise<XMLTVWorkerResponse> {
   const started = Date.now();
   const options = deserializeOptions(request);
-  const first = await parsePass(
+  let first: PassResult | null = await parsePass(
     request.url,
     request.timeout,
     options,
@@ -193,15 +240,66 @@ export async function fetchAndParseXMLTVInWorker(
     1,
   );
   if (!first.parser.needsOrderRetry()) {
-    return createResponse(first, 1, Date.now() - started);
+    return deliverGuide(createResponse(first, 1, Date.now() - started), first.guide, request, emitChunk);
   }
+  const channelIds = first.parser.acceptedChannelIds();
+  const { inputBytes, chunks } = first;
+  // Its parser's sink holds the whole first guide, which the retry rebuilds.
+  first = null;
   const retry = await parsePass(request.url, request.timeout, {
     ...options,
-    channelIds: first.parser.acceptedChannelIds(),
+    channelIds,
   }, 'retry', true, emitChunk, 2);
-  retry.inputBytes += first.inputBytes;
-  retry.chunks += first.chunks;
-  return createResponse(retry, 2, Date.now() - started);
+  retry.inputBytes += inputBytes;
+  retry.chunks += chunks;
+  return deliverGuide(createResponse(retry, 2, Date.now() - started), retry.guide, request, emitChunk);
+}
+
+// The page gets the guide once, as packed text blocks: cloning strings is
+// cheap, and the page decodes them a slice at a time. The same blocks are
+// held for the cache write, which only a complete guide with programmes gets.
+function deliverGuide(
+  response: XMLTVWorkerResponse,
+  guide: ParsedEpg,
+  request: XMLTVWorkerRequest,
+  emitChunk: (chunk: XMLTVWorkerChunk) => void,
+): XMLTVWorkerResponse {
+  const cacheable = request.holdForCache
+    && response.stats.droppedBudget === 0
+    && response.stats.programmesKept > 0;
+  const packed = packEpg(guide);
+  sendBlocks('channels', packed.channels, emitChunk);
+  sendBlocks('programmes', packed.programmes, emitChunk);
+  return cacheable ? { ...response, held: { token: holdEpg(() => packed) } } : response;
+}
+
+function sendBlocks(
+  part: 'channels' | 'programmes',
+  blocks: string[],
+  emitChunk: (chunk: XMLTVWorkerChunk) => void,
+): void {
+  let batch: string[] = [];
+  let chars = 0;
+  for (const block of blocks) {
+    batch.push(block);
+    chars += block.length;
+    if (chars >= GUIDE_MESSAGE_CHARS) {
+      emitChunk({ kind: 'guide', part, blocks: batch });
+      batch = [];
+      chars = 0;
+    }
+  }
+  if (batch.length) emitChunk({ kind: 'guide', part, blocks: batch });
+}
+
+interface PassResult {
+  data: XMLTVWorkerResponse['data'];
+  guide: ParsedEpg;
+  parser: XMLTVStreamParser;
+  encoding: 'gzip' | 'plain';
+  transport: 'stream' | 'array_buffer';
+  inputBytes: number;
+  chunks: number;
 }
 
 async function parsePass(
@@ -210,16 +308,9 @@ async function parsePass(
   options: XMLTVParseOptions,
   pass: 'initial' | 'retry',
   retried: boolean,
-  emitChunk?: (chunk: XMLTVWorkerChunk) => void,
+  emitChunk: (chunk: XMLTVWorkerChunk) => void,
   attempt = 1,
-): Promise<{
-  data: XMLTVWorkerResponse['data'];
-  parser: XMLTVStreamParser;
-  encoding: 'gzip' | 'plain';
-  transport: 'stream' | 'array_buffer';
-  inputBytes: number;
-  chunks: number;
-}> {
+): Promise<PassResult> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeout);
   let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
@@ -238,9 +329,8 @@ async function parsePass(
     reader = typeof response.body?.getReader === 'function'
       ? response.body.getReader()
       : null;
-    emitChunk?.({ kind: 'reset', attempt });
-    const batcher = emitChunk ? new XMLTVBatcher(attempt, emitChunk) : undefined;
-    const parser = new XMLTVStreamParser(options, batcher);
+    const accumulator = new XMLTVAccumulator();
+    const parser = new XMLTVStreamParser(options, accumulator);
     if (!reader) {
       transport = 'array_buffer';
       stage = 'decode_parse';
@@ -266,13 +356,16 @@ async function parsePass(
       const gunzip = encoding === 'gzip'
         ? new Gunzip(chunk => writeDecoded(parser, decoder, chunk))
         : null;
+      const consume = (bytes: Uint8Array): void => {
+        consumeChunk(bytes, parser, decoder, gunzip);
+      };
       stage = 'decode_parse';
       if (prefix.length) {
         inputBytes += prefix.length;
         chunks++;
         emitProgress();
         stage = 'decode_parse';
-        consumeChunk(prefix, parser, decoder, gunzip);
+        consume(prefix);
       }
       while (!complete) {
         stage = 'read';
@@ -286,7 +379,7 @@ async function parsePass(
           chunks++;
           emitProgress();
           stage = 'decode_parse';
-          consumeChunk(next.value, parser, decoder, gunzip);
+          consume(next.value);
         }
       }
       stage = 'decode_parse';
@@ -296,9 +389,9 @@ async function parsePass(
     }
     stage = 'finish';
     const data = parser.finish();
-    batcher?.flush();
     return {
       data,
+      guide: accumulator.complete(data),
       parser,
       encoding,
       transport,
@@ -329,7 +422,7 @@ async function parsePass(
   }
 
   function emitProgress(): void {
-    if (!emitChunk || inputBytes < nextProgressBytes) return;
+    if (inputBytes < nextProgressBytes) return;
     emitChunk({
       kind: 'progress',
       attempt,
@@ -343,89 +436,22 @@ async function parsePass(
   }
 }
 
-class XMLTVBatcher implements XMLTVRecordSink {
-    private channels: Array<[string, EpgChannel]> = [];
-    private programmes = new Map<string, Programme[]>();
-    private programmeCount = 0;
-
-    constructor(
-      private readonly attempt: number,
-      private readonly emit: (chunk: XMLTVWorkerChunk) => void,
-    ) {}
+class XMLTVAccumulator implements XMLTVRecordSink {
+    private channels: Record<string, EpgChannel> = {};
+    private programmes: Record<string, Programme[]> = {};
+    private unsortedChannels = new Set<string>();
 
     channel(id: string, channel: EpgChannel): void {
-      this.channels.push([id, channel]);
-      if (this.channels.length >= CHANNEL_BATCH_SIZE) this.flushChannels();
+      this.channels[id] = channel;
     }
 
     programme(id: string, programme: Programme): void {
-      const list = this.programmes.get(id);
-      if (list) list.push(programme);
-      else this.programmes.set(id, [programme]);
-      this.programmeCount++;
-      if (this.programmeCount >= PROGRAMME_BATCH_SIZE) this.flushProgrammes();
-    }
-
-    flush(): void {
-      this.flushChannels();
-      this.flushProgrammes();
-    }
-
-    private flushChannels(): void {
-      if (!this.channels.length) return;
-      this.emit({
-        kind: 'channels',
-        attempt: this.attempt,
-        entries: this.channels,
-      });
-      this.channels = [];
-    }
-
-    private flushProgrammes(): void {
-      if (!this.programmeCount) return;
-      this.emit({
-        kind: 'programmes',
-        attempt: this.attempt,
-        entries: Array.from(this.programmes),
-      });
-      this.programmes = new Map();
-      this.programmeCount = 0;
-    }
-  }
-
-class XMLTVAccumulator {
-    private attempt = 0;
-    private channels: Record<string, EpgChannel> = {};
-    private programmes: Record<string, Programme[]> = {};
-    private lastStartByChannel = new Map<string, number>();
-    private unsortedChannels = new Set<string>();
-
-    accept(chunk: XMLTVWorkerChunk): void {
-      if (chunk.kind === 'reset') {
-        if (chunk.attempt < this.attempt) return;
-        this.attempt = chunk.attempt;
-        this.channels = {};
-        this.programmes = {};
-        this.lastStartByChannel = new Map();
-        this.unsortedChannels = new Set();
-        return;
+      const list = this.programmes[id] ?? (this.programmes[id] = []);
+      const previous = list[list.length - 1];
+      if (previous && programme.start.getTime() < previous.start.getTime()) {
+        this.unsortedChannels.add(id);
       }
-      if (chunk.attempt !== this.attempt) return;
-      if (chunk.kind === 'channels') {
-        for (const [id, channel] of chunk.entries) this.channels[id] = channel;
-        return;
-      }
-      if (chunk.kind === 'progress') return;
-      for (const [id, incoming] of chunk.entries) {
-        const list = this.programmes[id] ?? (this.programmes[id] = []);
-        for (const programme of incoming) {
-          const start = programme.start.getTime();
-          const previous = this.lastStartByChannel.get(id);
-          if (previous !== undefined && start < previous) this.unsortedChannels.add(id);
-          this.lastStartByChannel.set(id, start);
-          list.push(programme);
-        }
-      }
+      list.push(programme);
     }
 
     complete(metadata: ParsedEpg): ParsedEpg {
@@ -505,14 +531,7 @@ function appendBytes(left: Uint8Array, right: Uint8Array): Uint8Array {
 }
 
 function createResponse(
-  pass: {
-    data: XMLTVWorkerResponse['data'];
-    parser: XMLTVStreamParser;
-    encoding: 'gzip' | 'plain';
-    transport: 'stream' | 'array_buffer';
-    inputBytes: number;
-    chunks: number;
-  },
+  pass: PassResult,
   attempts: number,
   elapsed: number,
 ): XMLTVWorkerResponse {

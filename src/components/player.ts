@@ -7,6 +7,7 @@ import type {
   LivePlaybackSnapshot,
   LivePlaybackStatus,
   NumberEvent,
+  ResumeEntry,
   SubtitleTrackOption,
   VodPlayback,
   VodQueueItem,
@@ -42,6 +43,7 @@ import { resolutionBadge, hdrLabel, frameRateLabel, pickVariant, codecName, audi
 import { extFromUrl, diagnosticStreamUrl, streamUrlMime } from '../utils/url';
 import { isWebOS } from '../utils/platform';
 import { InputMode } from '../navigation/input-mode';
+import { KeyHandler } from '../navigation/key-handler';
 import { probeMedia } from '../services/media-probe';
 import { ChannelHealthService } from '../services/channel-health';
 import { createLogger } from '../utils/logger';
@@ -56,6 +58,8 @@ import {
 } from '../services/playback-rate';
 import {
   PlayerOsd,
+  upNextCard,
+  vodHeading,
   type PlayerOsdSnapshot,
   type PlayerOsdStreamInfo,
 } from './player-osd';
@@ -99,6 +103,9 @@ export class Player {
   private vod: VodPlayback | null = null;
   private upNextSeconds = 0;
   private upNextTimer: ReturnType<typeof setInterval> | null = null;
+  // A CH skip waits to settle; the episode playing when it began decides the PIN.
+  private skipTimer: ReturnType<typeof setTimeout> | null = null;
+  private skipOrigin: VodPlayback | null = null;
   private upNextAuthorized = false;
   private vodTracksLatePending = false;
   private pendingResumeSecs = 0;
@@ -247,6 +254,7 @@ export class Player {
       onResync: () => this.resyncAV(),
       onPlayNext: () => this.playNextItem(),
       onCancelNext: () => this.cancelNextItem(),
+      onSkipEpisode: (step) => this.skipEpisode(step),
     });
     this.stallWatchdog = new StallWatchdog({
       probe: (): StallProbe => {
@@ -526,6 +534,11 @@ export class Player {
   suspend(): void {
     this.hidden = true;
     this.startupWatchdog.stop();
+    // A pending skip waits for resume(); skipOrigin marks it.
+    if (this.skipTimer) {
+      clearTimeout(this.skipTimer);
+      this.skipTimer = null;
+    }
     if (!this.videoEl || !this.currentChannel) return;
     if (this.wasPlayingBeforeHide) return; // already suspended
     // A Luna pipeline lives outside the page, so hiding always unloads it,
@@ -628,7 +641,9 @@ export class Player {
     // readyState below HAVE_CURRENT_DATA.
     if (this.startupPending && this.videoEl.readyState < 2) this.startupWatchdog.start();
     if (this.vod) {
-      this.reauthorizeVod(this.vod, this.videoEl);
+      const skipped = this.skipOrigin !== null;
+      this.clearSkipTimer();
+      this.reauthorizeVod(this.vod, this.videoEl, skipped);
       return;
     }
     if (!this.currentChannel) return;
@@ -659,10 +674,13 @@ export class Player {
     }
   }
 
-  private reauthorizeVod(v: VodPlayback, el: HTMLVideoElement): void {
+  // A skip still pending when the app hid starts its target here.
+  private reauthorizeVod(v: VodPlayback, el: HTMLVideoElement, skipped = false): void {
     const resumeSecs = this.pendingSeekTarget ?? (el.currentTime || v.resumeSecs);
     const resumed: VodPlayback = { ...v, resumeSecs };
-    if (this.authorizeVod(resumed, () => { if (this.vod !== v) this.playVodResolved(resumed); })) return;
+    if (this.authorizeVod(resumed, () => {
+      if (skipped || this.vod !== v) this.playVodResolved(resumed);
+    })) return;
     log.info('Resume waits for the parental PIN', 'event=parental.playback.relocked',
       `kind=${v.kind}`);
     this.stop();
@@ -855,7 +873,8 @@ export class Player {
   // Right opens the VOD menu unless it can seek (OSD up with a usable
   // duration), or the subtitle search overlay or up-next countdown owns the key.
   vodRightOpensMenu(): boolean {
-    return !this.canSeek() && !this.tracks.isSubtitleSearchOpen() && this.upNextTimer === null;
+    return !this.canSeek() && !this.tracks.isSubtitleSearchOpen() && this.upNextTimer === null
+      && this.skipTimer === null;
   }
 
   // Back hides the OSD of a stream the user paused before it stops playback:
@@ -895,6 +914,7 @@ export class Player {
   }
 
   private playVodResolved(v: VodPlayback): void {
+    this.clearSkipTimer();
     if (this.liveSessionActive) this.rememberLiveAudio();
     this.playbackActive = true;
     this.livePreviewMode = false;
@@ -932,22 +952,33 @@ export class Player {
     show(this.container);
   }
 
-  private saveVodResume(): void {
+  // `advance: false` (stepping back) keeps an episode left in its credits from
+  // moving the series' place on.
+  private saveVodResume({ advance = true } = {}): void {
     const v = this.vod;
     const el = this.videoEl;
     if (!v || !el) return;
     const dur = Number.isFinite(el.duration) ? el.duration : 0;
     if (dur <= 0) return; // metadata not loaded yet — currentTime is 0/unknown; don't clobber the stored point
+    const position = this.pendingSeekTarget ?? (el.currentTime || 0);
+    // Leaving in the credits finishes the episode as `ended` would.
+    if (advance && v.kind === 'episode' && v.watchlistOwner
+        && position >= dur - CONFIG.XTREAM.RESUME_FINISH_PAD) {
+      this.advanceSeriesResume(v);
+      return;
+    }
     StorageService.setResume({
       accountId: v.accountId, kind: v.kind, itemId: v.itemId,
       name: v.title, poster: v.poster, ext: extFromUrl(v.url),
-      position: this.pendingSeekTarget ?? (el.currentTime || 0),
+      position,
       duration: dur,
       updatedAt: Date.now(),
       episodeQueue: v.episodeQueue,
       watchlistOwner: v.watchlistOwner,
+      season: v.searchMeta?.season,
+      episode: v.searchMeta?.episode,
       categoryId: v.categoryId,
-    });
+    }, { keepStart: v.holdsSeriesPlace === true });
   }
 
   private saveCatchupProgress(opts?: { completed?: boolean }): void {
@@ -1016,8 +1047,13 @@ export class Player {
       case 'yellow':
         this.showOSD();
         break;
+      case 'channel_up':
+      case 'channel_down':
+        // A wheel flick sends several notches; only a deliberate key skips.
+        if (!KeyHandler.isWheelAction()) this.skipEpisode(action === 'channel_up' ? 1 : -1);
+        break;
       default:
-        break; // up/down/channel_up/channel_down are no-ops (no channels in VOD)
+        break; // up/down are no-ops (no channels in VOD)
     }
   }
 
@@ -1070,11 +1106,11 @@ export class Player {
     if (this.vod) {
       const v = this.vod;
       this.vod = null; // before stop(), so it doesn't re-save a resume point for a finished movie
-      StorageService.clearResume(v.accountId, v.kind, v.itemId);
-      if (v.kind === 'vod') {
-        StorageService.removeWatchlist(v.accountId, 'vod', v.itemId);
-      } else if ((v.episodeQueue?.length ?? 0) === 0 && v.watchlistOwner) {
-        StorageService.removeWatchlist(v.accountId, v.watchlistOwner.kind, v.watchlistOwner.itemId);
+      if (v.kind === 'episode' && v.watchlistOwner) {
+        this.advanceSeriesResume(v);
+      } else {
+        StorageService.clearResume(v.accountId, v.kind, v.itemId);
+        if (v.kind === 'vod') StorageService.removeWatchlist(v.accountId, 'vod', v.itemId);
       }
       this.stop();
       const queue = v.kind === 'episode' ? v.episodeQueue : v.watchlistQueue;
@@ -1097,6 +1133,11 @@ export class Player {
     }
   }
 
+  // The info bar shows now/next, which a guide restored after it opened adds.
+  refreshOsd(): void {
+    if (this.osd.isVisible() && !this.osd.showsMessage()) this.osd.render();
+  }
+
   stop(): void {
     if (this.liveSessionActive) this.rememberLiveAudio();
     this.liveSessionActive = false;
@@ -1109,15 +1150,10 @@ export class Player {
     this.lunaRestore = null;
     this.startPlaybackGeneration();
     this.clearUpNextTimer();
-    this.vodTracksLatePending = false;
+    this.clearSkipTimer();
     if (this.vod) this.saveVodResume();
     this.saveCatchupProgress(); // save before the video element is torn down
-    this.stallWatchdog.stop();
-    this.startupPending = false;
-    this.startupWatchdog.stop();
-    this.tracks.stop();
-    this.playbackRate.reset();
-    this.pipeline.destroy();
+    this.releaseStream();
     if (this.videoEl) {
       this.videoEl.pause();
       this.videoEl.removeAttribute('src');
@@ -1140,12 +1176,60 @@ export class Player {
     this.onPlaybackStateChanged();
   }
 
+  private releaseStream(): void {
+    this.vodTracksLatePending = false;
+    this.stallWatchdog.stop();
+    this.startupPending = false;
+    this.startupWatchdog.stop();
+    this.tracks.stop();
+    this.playbackRate.reset();
+    this.pipeline.destroy();
+  }
+
+  // A finished episode moves its series' place on: its point and the series'
+  // earlier ones go, a later episode keeps its progress, and the next episode
+  // holds the place even before it reaches RESUME_MIN_SECS. The final episode
+  // takes the series off Watchlist.
+  private advanceSeriesResume(finished: VodPlayback): void {
+    const owner = finished.watchlistOwner!;
+    const at = finished.searchMeta;
+    const next = finished.episodeQueue?.[0];
+    let saved: ResumeEntry | null = null;
+    for (const entry of StorageService.getResumeList(finished.accountId)) {
+      if (entry.kind !== 'episode' || entry.watchlistOwner?.itemId !== owner.itemId) continue;
+      if (entry.itemId === finished.itemId) continue;
+      if (next && entry.itemId === next.itemId) {
+        saved = entry;
+        continue;
+      }
+      const later = at?.season !== undefined
+        && at.episode !== undefined && entry.season !== undefined && entry.episode !== undefined
+        && (entry.season > at.season || (entry.season === at.season && entry.episode > at.episode));
+      if (!later) StorageService.clearResume(entry.accountId, 'episode', entry.itemId);
+    }
+    StorageService.clearResume(finished.accountId, 'episode', finished.itemId);
+    if ((finished.episodeQueue?.length ?? 0) === 0) {
+      StorageService.removeWatchlist(finished.accountId, owner.kind, owner.itemId);
+    }
+    if (!next || next.watchlistOwner?.itemId !== owner.itemId) return;
+    StorageService.setResume({
+      accountId: next.accountId, kind: 'episode', itemId: next.itemId,
+      name: next.title, poster: next.poster, ext: extFromUrl(next.url),
+      position: saved?.position ?? 0, duration: saved?.duration ?? 0, updatedAt: Date.now(),
+      episodeQueue: finished.episodeQueue!.slice(1),
+      watchlistOwner: next.watchlistOwner,
+      season: next.searchMeta?.season,
+      episode: next.searchMeta?.episode,
+      categoryId: next.categoryId,
+    }, { keepStart: true });
+  }
+
   private startNextItem(
     next: VodQueueItem,
     remaining: VodQueueItem[],
     isEpisodeQueue: boolean,
     onBack: () => void,
-    finished: VodQueueItem,
+    finished: VodPlayback,
   ): void {
     this.recreateVideoEl();
     // The PIN unlocked the whole series, so its next episode continues.
@@ -1154,7 +1238,9 @@ export class Player {
       ...next,
       resumeSecs: 0,
       episodeQueue: isEpisodeQueue ? remaining : undefined,
+      previousEpisodes: isEpisodeQueue ? [...(finished.previousEpisodes ?? []), queueItem(finished)] : undefined,
       watchlistQueue: isEpisodeQueue ? undefined : remaining,
+      holdsSeriesPlace: isEpisodeQueue && !!next.watchlistOwner,
       onBack,
     };
     this.upNextSeconds = CONFIG.PLAYER.UP_NEXT_COUNTDOWN;
@@ -1188,6 +1274,66 @@ export class Player {
     // A locked next item waits for the PIN off the player, as a live resume
     // does, so cancelling the prompt can't strand a blank up-next screen.
     if (!this.authorizeVod(next, () => this.playVodResolved(next))) this.cancelNextItem();
+  }
+
+  // CH+/CH- (and the OSD skip buttons) step through a series as they step
+  // through channels. The episode left keeps its point; the series' place
+  // follows to the one started, which resumes from its own point.
+  skipEpisode(step: 1 | -1): void {
+    const v = this.vod;
+    if (!v || v.kind !== 'episode' || this.upNextTimer) return;
+    const after = v.episodeQueue ?? [];
+    const before = v.previousEpisodes ?? [];
+    const target = step > 0 ? after[0] : before[before.length - 1];
+    if (!target) return;
+    const current = queueItem(v);
+    const saved = StorageService.getResume(target.accountId, 'episode', target.itemId);
+    const next: VodPlayback = {
+      ...target,
+      resumeSecs: saved?.position ?? 0,
+      episodeQueue: step > 0 ? after.slice(1) : [current, ...after],
+      previousEpisodes: step > 0 ? [...before, current] : before.slice(0, -1),
+      holdsSeriesPlace: true,
+      onBack: v.onBack,
+    };
+    // The first press leaves the episode at once; later ones only move the
+    // target, so a run of presses opens one stream.
+    if (this.skipTimer) {
+      clearTimeout(this.skipTimer);
+    } else {
+      this.saveVodResume({ advance: step > 0 });
+      this.releaseStream();
+      this.pendingResumeSecs = 0;
+      this.pendingSeekTarget = null;
+      this.vodInfo = null;
+      this.recreateVideoEl();
+      this.skipOrigin = v;
+    }
+    this.vod = next;
+    this.showOSD();
+    this.skipTimer = setTimeout(() => this.startSkippedEpisode(), CONFIG.PLAYER.EPISODE_SKIP_SETTLE_MS);
+  }
+
+  private startSkippedEpisode(): void {
+    const next = this.vod;
+    const origin = this.skipOrigin;
+    this.clearSkipTimer();
+    if (!next || !origin) return;
+    if (sameParentalItem(origin, next)) {
+      this.playVodResolved(next);
+      return;
+    }
+    this.vod = null;
+    if (!this.authorizeVod(next, () => this.playVodResolved(next))) {
+      this.stop();
+      next.onBack();
+    }
+  }
+
+  private clearSkipTimer(): void {
+    if (this.skipTimer) clearTimeout(this.skipTimer);
+    this.skipTimer = null;
+    this.skipOrigin = null;
   }
 
   private cancelNextItem(): void {
@@ -1737,8 +1883,14 @@ export class Player {
       channel,
       channelNumber: this.currentIndexAnchor + 1,
       catchup: this.catchupInfo,
-      vodTitle: this.vod?.title ?? null,
+      vodTitle: this.vod ? vodHeading(this.vod).title : null,
+      vodDetail: this.vod ? vodHeading(this.vod).detail : '',
       upNextSeconds: this.upNextSeconds,
+      upNext: this.vod && this.upNextSeconds > 0 ? upNextCard(this.vod) : null,
+      episodeNav: this.vod?.kind === 'episode' ? {
+        previous: (this.vod.previousEpisodes?.length ?? 0) > 0,
+        next: (this.vod.episodeQueue?.length ?? 0) > 0,
+      } : null,
       dvr: win && video
         ? dvrState(win, position, CONFIG.PLAYER.DVR_LIVE_EDGE)
         : null,
@@ -1909,6 +2061,13 @@ export class Player {
     this.currentChannel = resolved.channel;
     this.currentIndex = resolved.channelIndex;
     this.currentIndexAnchor = resolved.channelIndex;
+    // The saved index follows its channel when the list reorders, since it
+    // picks among copies that differ only by a token.
+    const saved = StorageService.getLastChannel();
+    if (saved && saved.index !== resolved.channelIndex
+        && saved.exact === channelExactStreamKey(resolved.channel)) {
+      StorageService.setLastChannel({ ...saved, index: resolved.channelIndex });
+    }
     this.onTvPlaybackChanged(
       resolved.channelIndex,
       this.catchupInfo ? this.catchupInfo.start * 1000 : null,
@@ -2095,6 +2254,15 @@ function sameParentalScope(a: Channel, b: Channel): boolean {
     return [request.target, ...request.parents].map(parentalTargetKey).sort().join('\n');
   };
   return scope(a) === scope(b);
+}
+
+function queueItem(v: VodPlayback): VodQueueItem {
+  return {
+    url: v.url, title: v.title, poster: v.poster, accountId: v.accountId, itemId: v.itemId,
+    kind: v.kind, categoryId: v.categoryId, parentalItemId: v.parentalItemId,
+    subtitles: v.subtitles, searchMeta: v.searchMeta, episodeTitle: v.episodeTitle,
+    watchlistOwner: v.watchlistOwner,
+  };
 }
 
 function sameParentalItem(a: VodQueueItem, b: VodQueueItem): boolean {

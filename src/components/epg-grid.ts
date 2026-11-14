@@ -82,6 +82,7 @@ export class EpgGrid {
   private focusProg = 0;
   private resumePrompt = new CatchupResumePrompt('prompt.epg');
   private archiveLoadingKey = '';
+  private loadingChannels = false;
   private readonly channelVirtualizer = new VirtualList({
     itemSize: CHANNEL_ROW_SIZE,
     overscan: VIRTUAL_OVERSCAN,
@@ -172,6 +173,11 @@ export class EpgGrid {
     });
     this.bindEvents();
   }
+  // While a load has shown nothing yet, the empty guide says so.
+  setLoading(loading: boolean): void {
+    this.loadingChannels = loading;
+  }
+
 
   private currentScope(): ChannelScope {
     return { group: this.selectedGroup, playlist: this.selectedPlaylist || undefined };
@@ -229,19 +235,11 @@ export class EpgGrid {
     // Day columns span the earliest..latest program START. Using start (not
     // stop) means a program that merely runs past midnight doesn't add an
     // empty day column for the day it spills into — it belongs to its start day.
-    let minStart = Infinity;
-    let maxStart = -Infinity;
-    for (const progs of Object.values(EpgService.programmes)) {
-      if (!progs.length) continue;
-      const first = progs[0].start.getTime();
-      const last = progs[progs.length - 1].start.getTime();
-      if (first < minStart) minStart = first;
-      if (last > maxStart) maxStart = last;
-    }
-    if (minStart === Infinity) return [];
+    const range = EpgService.getProgrammeStartRange();
+    if (!range) return [];
 
-    const firstDay = startOfDisplayDay(new Date(minStart));
-    const lastDay = startOfDisplayDay(new Date(maxStart));
+    const firstDay = startOfDisplayDay(new Date(range.min));
+    const lastDay = startOfDisplayDay(new Date(range.max));
 
     const opts: Date[] = [];
     let cur = firstDay;
@@ -480,7 +478,7 @@ export class EpgGrid {
     const programmes = this.getCurrentProgrammes();
     this.programmeCount = programmes.length;
     const epgId = channel ? EpgService.findChannelId(channel) : null;
-    const programmeSource = epgId ? EpgService.programmes[epgId] ?? null : null;
+    const programmeSource = epgId ? EpgService.getProgrammes(epgId) : null;
     if (programmeSource !== this.programmeSource) {
       this.programmeSource = programmeSource;
       this.programmeSizeKey = '';
@@ -634,7 +632,9 @@ export class EpgGrid {
               `;
             })}
               </div>
-            ` : html`<div class="epg-no-channels">${t('channel.empty')}</div>`}
+            ` : html`<div class="epg-no-channels">${
+              t(this.loadingChannels ? 'app.loadingChannels' : 'channel.empty')
+            }</div>`}
             </div>
           </div>
           <div class="epg-right-pane">

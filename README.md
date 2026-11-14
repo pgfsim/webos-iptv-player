@@ -37,13 +37,14 @@ account blocked (HTTP 403). In this fork:
 - **No per-category fallback.** If a whole-catalog request fails, the app
   does not retry it by category. It waits an hour before asking again, so a
   provider that refuses is not hammered.
-- **Parsed while it downloads.** Each catalog is read one title at a time as
-  it arrives. Only the fields the app uses are kept, so a catalog of tens of
-  megabytes is never held as one string or as raw JSON objects.
-- **Compact storage in memory.** Titles are stored by column: one packed
-  string per field, plus offsets, and poster URLs share their directory. A
-  few hundred thousand titles take a fraction of the memory that one object
-  per title would.
+- **Off the UI thread.** Upstream's huge-playlist engine is used: each
+  catalog downloads and is parsed in the app's background worker, keeping
+  only the fields the app uses, and Search queries run in that worker too.
+- **Compact saved catalogs.** Upstream saves one record per title, which
+  for 185,000 movies is about 50 MB, more than the TV's whole quota, so the
+  save always failed. This fork saves catalogs by column: field names and
+  the account id are stored once, and poster URLs share their start. The
+  movie catalog saves at about 20 MB.
 - **Preloaded in the background.** About 10 seconds after the app starts,
   the catalogs download in the background. By the time you open Search it
   is usually instant. Search and the preload share one download, and closing
@@ -53,7 +54,7 @@ account blocked (HTTP 403). In this fork:
   **Xtream content catalog refresh interval** in Settings expires. On the
   test panel that is about 20 MB of movies and 5 MB of series.
 - **Results appear early.** Queries run as soon as channels are indexed.
-  Programs, movies and series join the results as each one arrives.
+  Movies and series join the results once their index is built.
 - **Storage sized for a 48 MB quota.** The original budgets half the quota,
   which cannot hold a 20 MB channel list and both catalogs, so each launch
   downloaded one again. This fork budgets the whole quota (record sizes are
@@ -71,8 +72,8 @@ Measured on the NANO866NA with a large panel and the guide off:
 | | Memory | Notes |
 | --- | --- | --- |
 | App start | ~80 MB | |
-| Background preload done | ~240 MB | movies ready ~80 s, series ~110 s after launch, 2 requests |
-| Search peak | ~370 MB | no crash; index ready ~4 s after the catalogs |
+| Background preload done | ~250 MB | movies ~65 s, series ~95 s after launch, 2 requests |
+| Search peak | ~260 MB | no crash; catalogs read from storage, no requests |
 
 ### Turn the guide off per account
 
