@@ -1,4 +1,4 @@
-import { test, expect, routeLiveManifest, neuterVideo, SAMPLE_M3U, enterTab } from './helpers';
+import { test, expect, routeLiveManifest, neuterVideo, SAMPLE_M3U, enterTab, liveLoaded } from './helpers';
 import { seedXtream } from './fixtures/xtream';
 
 // Seed one Xtream account (enables the tab bar) and stub the player_api.php
@@ -78,6 +78,111 @@ test('Continue Watching updates the hero from saved episodes by pointer and remo
   expect(details).toEqual([]);
 });
 
+test('a Continue Watching series opens its detail on Resume, and Back returns there', async ({ page }) => {
+  await seedSeries(page);
+  await neuterVideo(page);
+  await page.addInitScript(() => {
+    const resume: Record<string, unknown> = {};
+    for (const [itemId, label, updatedAt] of [['10', 'S1E1 — Episode One', 2], ['9', 'S1E0', 1]] as const) {
+      resume[`x1|episode|${itemId}`] = {
+        accountId: 'x1', kind: 'episode', itemId, name: `Series One — ${label}`, poster: '', ext: 'mp4',
+        categoryId: '1', position: 100, duration: 600, updatedAt,
+        watchlistOwner: { kind: 'series', itemId: '1', name: 'Series One', poster: '' },
+      };
+    }
+    localStorage.setItem('iptv_resume', JSON.stringify(resume));
+  });
+  await page.goto('/');
+  await enterTab(page, 'series');
+  const view = page.locator('#view-series');
+  const tile = view.locator('[data-rail-key="continue"] .catalog-tile');
+  await expect(tile).toHaveCount(1);
+  await expect(tile.locator('.catalog-tile-name')).toHaveText('Series One');
+  await expect(tile.locator('.catalog-tile-sub')).toHaveText('S1 E1');
+  await tile.evaluate((el) => el.dispatchEvent(new CustomEvent('nav:hover', { bubbles: true })));
+  await page.keyboard.press('Enter');
+
+  const resume = view.locator('[data-action="resume"]');
+  await expect(resume).toHaveClass(/focused/);
+  await expect(resume).toContainText('S1 E1');
+  await page.keyboard.press('Enter');
+  await expect(page.locator('#view-player')).toBeVisible();
+  await page.evaluate(() => document.dispatchEvent(new KeyboardEvent('keydown', { keyCode: 461, bubbles: true })));
+  await expect(view.locator('.series-detail')).toBeVisible();
+  await expect(resume).toHaveClass(/focused/);
+  await page.evaluate(() => document.dispatchEvent(new KeyboardEvent('keydown', { keyCode: 461, bubbles: true })));
+  await expect(tile).toHaveClass(/focused/);
+});
+
+test('stepping right along Continue Watching keeps a series\' stacked cards in view', async ({ page }) => {
+  await seedSeries(page);
+  await page.addInitScript(() => {
+    const resume: Record<string, unknown> = {};
+    for (let i = 0; i < 12; i++) {
+      resume[`x1|episode|e${i}`] = {
+        accountId: 'x1', kind: 'episode', itemId: `e${i}`, name: `Series ${i} — S1E1`, poster: '', ext: 'mp4',
+        position: 100, duration: 600, updatedAt: 20 - i, season: 1, episode: 1,
+        watchlistOwner: { kind: 'series', itemId: `s${i}`, name: `Series ${i}`, poster: '' },
+      };
+    }
+    localStorage.setItem('iptv_resume', JSON.stringify(resume));
+  });
+  await page.goto('/');
+  await enterTab(page, 'series');
+  const track = page.locator('#view-series [data-rail-key="continue"] .catalog-rail-track');
+  const tiles = track.locator('.catalog-tile-stack');
+  await tiles.first().evaluate((el) => el.dispatchEvent(new CustomEvent('nav:hover', { bubbles: true })));
+  await page.keyboard.press('ArrowRight');
+  for (let i = 1; i < 8; i++) {
+    await page.keyboard.press('ArrowRight');
+    await expect(tiles.nth(i + 1)).toHaveClass(/focused/);
+  }
+  await expect.poll(() => track.evaluate((el) => {
+    const tile = el.querySelector<HTMLElement>('.catalog-tile.focused')!;
+    const back = parseFloat(getComputedStyle(tile, '::after').width);
+    return el.getBoundingClientRect().right - (tile.getBoundingClientRect().left + back);
+  })).toBeGreaterThanOrEqual(0);
+});
+
+test('CH+ and CH- step through a series\' episodes, as the OSD skips do', async ({ page }) => {
+  await seedSeries(page);
+  await neuterVideo(page);
+  await page.route('**/player_api.php*action=get_series_info*', (route) => route.fulfill({
+    status: 200, contentType: 'application/json', body: JSON.stringify({
+      episodes: { '1': [1, 2, 3].map((n) => ({
+        id: 10 + n, title: `Episode ${n}`, season: 1, episode_num: n, container_extension: 'mp4',
+        info: { plot: '', duration_secs: 1500, movie_image: '' },
+      })) },
+    }),
+  }));
+  await page.goto('/');
+  await enterTab(page, 'series');
+  await page.locator('.catalog-tile[data-item-id="1"]')
+    .evaluate((el) => el.dispatchEvent(new CustomEvent('nav:hover', { bubbles: true })));
+  await page.keyboard.press('Enter');
+  await page.locator('.episode-row[data-episode-id="12"]')
+    .evaluate((el) => el.dispatchEvent(new CustomEvent('nav:hover', { bubbles: true })));
+  await page.keyboard.press('Enter');
+
+  const osd = page.locator('#player-osd');
+  const title = osd.locator('.osd-vod-detail');
+  const previous = osd.locator('[data-skip-episode="-1"]');
+  const next = osd.locator('[data-skip-episode="1"]');
+  await expect(title).toContainText('S1 E2');
+  await expect(previous).toBeEnabled();
+  await expect(next).toBeEnabled();
+
+  await page.keyboard.press('PageUp');
+  await expect(title).toContainText('S1 E3');
+  await expect(next).toBeDisabled();
+  await page.keyboard.press('PageDown');
+  await page.keyboard.press('PageDown');
+  await expect(title).toContainText('S1 E1');
+  await expect(previous).toBeDisabled();
+  await next.click();
+  await expect(title).toContainText('S1 E2');
+});
+
 test('browse Series, open a detail, and play an episode', async ({ page }) => {
   await seedSeries(page);
   await routeLiveManifest(page);
@@ -85,7 +190,7 @@ test('browse Series, open a detail, and play an episode', async ({ page }) => {
   // auto-eject the player, which would race this test's own Back navigation.
   await neuterVideo(page);
   await page.goto('/');
-  await expect(page.locator('#view-channels')).toBeVisible();
+  await liveLoaded(page);
 
   // Enter Series via the docked tab bar.
   await enterTab(page, 'series');
@@ -119,7 +224,7 @@ test('Back walks Series detail -> browse -> Live instead of ejecting', async ({ 
   await seedSeries(page);
   await routeLiveManifest(page);
   await page.goto('/');
-  await expect(page.locator('#view-channels')).toBeVisible();
+  await liveLoaded(page);
 
   // Enter Series via the docked tab bar.
   await enterTab(page, 'series');
@@ -141,7 +246,7 @@ test('Back walks Series detail -> browse -> Live instead of ejecting', async ({ 
 
   // Second Back from the browse top level returns to Live.
   await page.evaluate(() => document.dispatchEvent(new KeyboardEvent('keydown', { keyCode: 461, bubbles: true })));
-  await expect(page.locator('#view-channels')).toBeVisible();
+  await liveLoaded(page);
 });
 
 test('episode playback suppresses the live channel sidebar and shows a VOD-only menu at the pointer edges', async ({ page }) => {
@@ -156,7 +261,7 @@ test('episode playback suppresses the live channel sidebar and shows a VOD-only 
     Object.defineProperty(P, 'src', { configurable: true, set() { /* no-op */ }, get() { return ''; } });
   });
   await page.goto('/');
-  await expect(page.locator('#view-channels')).toBeVisible();
+  await liveLoaded(page);
 
   // Enter Series, open a detail, and play an episode (VOD mode).
   await enterTab(page, 'series');
@@ -195,7 +300,7 @@ test('Down from the tab bar resumes the Series detail Up left', async ({ page })
   await seedSeries(page);
   await routeLiveManifest(page);
   await page.goto('/');
-  await expect(page.locator('#view-channels')).toBeVisible();
+  await liveLoaded(page);
   await enterTab(page, 'series');
   await page.locator('.catalog-tile[data-item-id="1"]')
     .evaluate((el) => el.dispatchEvent(new CustomEvent('nav:hover', { bubbles: true })));
@@ -233,7 +338,7 @@ test('a key that only shows the ring brings a clipped tile into view', async ({ 
     localStorage.setItem('iptv_text_size', JSON.stringify('150'));
   });
   await page.goto('/');
-  await expect(page.locator('#view-channels')).toBeVisible();
+  await liveLoaded(page);
   await enterTab(page, 'series');
   const tile = page.locator('#view-series .catalog-tile').first();
   await expect(tile).toBeVisible();
@@ -266,7 +371,7 @@ test('opening the section with the pointer leaves the catalog where it loads', a
   await seedXtream(page, { catalog: 'large' });
   await routeLiveManifest(page);
   await page.goto('/');
-  await expect(page.locator('#view-channels')).toBeVisible();
+  await liveLoaded(page);
   await enterTab(page, 'series');
   const first = page.locator('#view-series .catalog-tile').first();
   await expect(first).toBeVisible();

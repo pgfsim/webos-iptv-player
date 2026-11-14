@@ -31,6 +31,7 @@ const {
     customization,
     playlistMock: {
       channels,
+      complete: true,
       groupsRevision: 0,
       playlistTabs: [] as { id: string; name: string }[],
       getGroupsForPlaylist: () => ['News', 'Sports'],
@@ -167,6 +168,7 @@ beforeEach(() => {
   toastMock.showToast.mockClear();
   healthMock.records = {};
   playlistMock.playlistTabs = [];
+  playlistMock.complete = true;
   storageMock.toggleFavorite.mockClear();
   storageMock.setFavorites.mockClear();
   storageMock.setChannelCustomization.mockClear();
@@ -411,6 +413,47 @@ describe('ChannelList.render', () => {
       expect(main.scrollTop).toBe(3000);
       expect(main.querySelector('[data-list-position="0"]')).toBeNull();
       expect(ringedEl(container, '.focused')).toBeNull();
+    });
+
+    it('a full render scrolls a partly hidden focused row back into view', () => {
+      scrollTo(200);
+      expect(ringed(main.querySelector('[data-list-position="0"]'))).toBe(true);
+      list.render();
+
+      expect(main.scrollTop).toBe(0);
+    });
+
+    it('a first render centers on the playing channel deep in the list', () => {
+      const fresh = document.createElement('div');
+      document.body.appendChild(fresh);
+      const other = new ChannelList(fresh, { onChannelSelect: vi.fn() });
+      other.setPlaying(250);
+      other.render();
+
+      expect(fresh.querySelector('.channel-main [data-channel-index="250"]')).not.toBeNull();
+      expect(fresh.querySelector('.channel-main [data-channel-index="0"]')).toBeNull();
+      fresh.remove();
+    });
+
+    it('does not center on a playing index whose channel sits earlier too', () => {
+      data.raw[250] = data.raw[200];
+      playlistMock.applyCustomization();
+      const fresh = document.createElement('div');
+      document.body.appendChild(fresh);
+      const other = new ChannelList(fresh, { onChannelSelect: vi.fn() });
+      other.setPlaying(250);
+      other.render();
+
+      expect(fresh.querySelector('.channel-main [data-list-position="200"]')).toBeNull();
+      fresh.remove();
+    });
+
+    it('a render with a group focused does not jump to the playing channel', () => {
+      hover(container.querySelector<HTMLElement>('.group-list [data-key^="g:"]')!);
+      list.setPlaying(250);
+      list.render();
+
+      expect(main.querySelector('[data-list-position="250"]')).toBeNull();
     });
 
     it('a full render leaves the detached focus for the next key to resume', () => {
@@ -692,6 +735,14 @@ describe('ChannelList.render', () => {
     hover(container.querySelector<HTMLElement>('[data-group="builtin:recently-watched"]')!);
     list.handleAction('select');
     expect(container.querySelector('.empty-state')?.textContent).toBe('Nothing watched yet');
+  });
+
+  it('says Recently Watched is still loading rather than empty during a load', () => {
+    list.setLoading(true);
+    list.render();
+    hover(container.querySelector<HTMLElement>('[data-group="builtin:recently-watched"]')!);
+    list.handleAction('select');
+    expect(container.querySelector('.empty-state')?.textContent).toBe('Loading channels…');
   });
 
   it('disables channel editing in Recently Watched', () => {
@@ -1051,6 +1102,51 @@ describe('ChannelList interaction', () => {
     expect(container.textContent).not.toContain('Alpha');
   });
 
+  describe('while a reload brings the channels back', () => {
+    const activeGroup = () => container.querySelector<HTMLElement>('.group-item.active')?.dataset.group;
+    const reloadWithoutBravo = (): Channel[] => {
+      playlistMock.complete = false;
+      const removed = data.channels.splice(1, 1);
+      playlistMock.groupsRevision++;
+      list.render();
+      return removed;
+    };
+    const arrive = (removed: Channel[]): void => {
+      data.channels.splice(1, 0, ...removed);
+      playlistMock.groupsRevision++;
+      list.render();
+    };
+
+    beforeEach(() => {
+      hover(container.querySelector<HTMLElement>('[data-group="source:Sports"]')!);
+      list.handleAction('select');
+    });
+
+    it('returns to the selected group once it arrives', () => {
+      const removed = reloadWithoutBravo();
+      expect(activeGroup()).toBe('builtin:all');
+      arrive(removed);
+      expect(activeGroup()).toBe('source:Sports');
+      expect(channelItems().map(item => item.textContent)).toEqual([expect.stringContaining('Bravo')]);
+    });
+
+    it('keeps a group picked meanwhile over the one it waited for', () => {
+      const removed = reloadWithoutBravo();
+      hover(container.querySelector<HTMLElement>('[data-group="source:News"]')!);
+      list.handleAction('select');
+      arrive(removed);
+      expect(activeGroup()).toBe('source:News');
+    });
+
+    it('forgets the group once the load ends without it', () => {
+      const removed = reloadWithoutBravo();
+      playlistMock.complete = true;
+      list.render();
+      arrive(removed);
+      expect(activeGroup()).toBe('builtin:all');
+    });
+  });
+
   it('clears the focused channel when the cursor leaves the view', () => {
     hover(channelItems()[1]);
     expect(ringed(channelItems()[1])).toBe(true);
@@ -1122,6 +1218,28 @@ describe('ChannelList interaction', () => {
     list.setPlaying(2);
     list.render();
     expect(channelItems()[2].classList.contains('playing')).toBe(true);
+  });
+
+  // A U+25B6 glyph here stalled the first layout after leaving the player
+  // on a fallback-font lookup.
+  it('draws the playing marker as an SVG, not a font glyph', () => {
+    recentMock.items = [{
+      kind: 'live',
+      channel: data.channels[2],
+      channelIndex: 2,
+      updatedAt: 1000,
+    }];
+    list.setPlaying(2);
+    list.render();
+    const expectSvgMarker = (row: HTMLElement) => {
+      const marker = row.querySelector('.playing-indicator')!;
+      expect(marker.querySelector('svg.playing-indicator-icon')).not.toBeNull();
+      expect(marker.textContent).toBe('');
+    };
+    expectSvgMarker(channelItems()[2]);
+    hover(container.querySelector<HTMLElement>('[data-group="builtin:recently-watched"]')!);
+    list.handleAction('select');
+    expectSvgMarker(channelItems()[0]);
   });
 
   it('highlightEntryPoint focuses the first channel without taking the caret', () => {

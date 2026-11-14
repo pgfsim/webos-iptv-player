@@ -125,9 +125,6 @@ export const TR_MESSAGES = {
   'catalog.seriesCount': {
     other: '{count} dizi',
   },
-  'catalog.episodeCount': {
-    other: '{count} bölüm',
-  },
   'catalog.noMovies': 'Bu hesapta film yok.',
   'catalog.noMoviesCategory': 'Bu kategoride film yok.',
   'catalog.noSeries': 'Bu hesapta dizi yok.',
@@ -189,6 +186,8 @@ export const TR_MESSAGES = {
     other: '{count} saniye içinde başlıyor',
   },
   'player.playNow': 'Şimdi oynat',
+  'player.previousEpisode': 'Önceki bölüm',
+  'player.nextEpisode': 'Sonraki bölüm',
   'player.unableToPlay': 'Bu video oynatılamıyor.',
   'player.reconnecting': 'Yeniden bağlanıyor…',
   'player.retryingCatchup': 'Geri İzle yeniden deneniyor…',
@@ -496,7 +495,6 @@ export const TR_MESSAGES = {
   'parental.askAfterLeaving': 'Uygulamadan çıktıktan sonra',
   'app.welcome': 'Başlamak için bir oynatma listesi URL’si ekleyin.',
   'app.loadingChannels': 'Kanallar yükleniyor…',
-  'app.loadingChannelsProgress': 'Kanallar yükleniyor… {processed} işlendi, {kept} tutuldu',
   'app.channelsLoaded': {
     other: '{count} kanal yüklendi',
   },

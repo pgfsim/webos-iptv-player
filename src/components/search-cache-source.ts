@@ -1,5 +1,4 @@
-import type { Channel, SeriesItem, VodItem } from '../types';
-import type { CatalogTable } from '../services/catalog-table';
+import type { Channel } from '../types';
 import { cacheRecordRef } from '../services/idb-cache';
 import type { ChannelCacheSource } from '../services/playlist-service';
 import type { ProgrammeCacheOrigin } from '../services/epg-service';
@@ -59,24 +58,39 @@ export function cachedChannelsRequest(
   };
 }
 
-/** The visible rows of a catalog; without concealment the table is kept whole. */
-export function selectCatalogItems<T extends VodItem | SeriesItem>(
-  table: CatalogTable<T>,
+/**
+ * Selects the visible catalog items in one pass. Without concealment every
+ * item stays, in order, and the worker needs no selection at all.
+ */
+export function selectCatalogItems<T>(
+  items: T[],
   concealing: boolean,
   concealed: (item: T) => boolean,
-): CatalogTable<T> {
-  return table.select(concealing ? (item: T) => !concealed(item) : null);
+): { items: T[]; selection: Uint32Array | null } {
+  if (!concealing) return { items, selection: null };
+  const visible: T[] = [];
+  const selection = new Uint32Array(items.length);
+  for (let i = 0; i < items.length; i++) {
+    if (concealed(items[i])) continue;
+    selection[visible.length] = i;
+    visible.push(items[i]);
+  }
+  return { items: visible, selection: selection.slice(0, visible.length) };
 }
 
-export function cachedNamesRequest(table: CatalogTable<VodItem | SeriesItem>): SearchCachedNames | null {
-  const columns = table.columns;
-  const record = columns ? cacheRecordRef(columns) : null;
-  if (!columns || !record || record.store !== 'catalog-cache') return null;
+export function cachedNamesRequest(
+  source: unknown[],
+  items: Array<{ name: string }>,
+  selection: Uint32Array | null,
+): SearchCachedNames | null {
+  const record = cacheRecordRef(source);
+  if (!record || record.store !== 'catalog-cache') return null;
+  if ((selection ? selection.length : source.length) !== items.length) return null;
   return {
     record,
-    length: columns.length,
-    selection: table.rows(),
-    samples: sampleDocuments(table.length, index => [table.nameAt(index)]),
+    length: source.length,
+    selection,
+    samples: sampleDocuments(items.length, index => [items[index].name]),
   };
 }
 

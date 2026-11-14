@@ -22,7 +22,7 @@ import { StorageService } from '../services/storage-service';
 import { RecentlyWatchedService, type RecentlyWatchedItem } from '../services/recently-watched';
 import { ChannelHealthService } from '../services/channel-health';
 import { groupIcon } from './group-icon';
-import { NAV_HORIZONTAL_ICON, favoriteIcon } from './icons';
+import { NAV_HORIZONTAL_ICON, PLAYING_ICON, favoriteIcon } from './icons';
 import { backKey, okHint } from './key-hints';
 import { channelLockBadge, liveGroupLockBadge } from './parental-badge';
 import { showToast } from './toast';
@@ -38,6 +38,7 @@ const CHANNEL_ROW_STRIDE = 88;
 const GROUP_ROW_STRIDE = 68;
 const CHANNEL_OVERSCAN = 12;
 const CHANNEL_VIEWPORT_FALLBACK = 900;
+const PLAYING_INDICATOR = `<div class="playing-indicator">${PLAYING_ICON}</div>`;
 
 type PreviewHintState = 'off' | 'ready' | 'active';
 type RowList = 'group' | 'channel';
@@ -79,6 +80,9 @@ export class ChannelList {
   private nav: SpatialNav;
   private editor: ChannelListEditor;
   private currentGroup: ChannelGroupId = 'builtin:all';
+  // The selected group a load still arriving has not reached yet.
+  private awaitedGroup: ChannelGroupId | null = null;
+  private loadingChannels = false;
   private currentPlaylist = '';  // '' = All playlists
   private playingIndex = -1;
   private previewFocused = false;
@@ -203,7 +207,7 @@ export class ChannelList {
       requestEditMode: group => this.enterEditMode(group),
       rowPosition: key => this.rowPosition(key)?.position ?? -1,
       setLocation: (group, playlist) => {
-        this.currentGroup = group;
+        this.selectGroup(group);
         this.currentPlaylist = playlist;
       },
     });
@@ -278,13 +282,26 @@ export class ChannelList {
     return { group: this.currentGroup, playlist: this.currentPlaylist || undefined };
   }
 
+  private selectGroup(group: ChannelGroupId): void {
+    this.currentGroup = group;
+    this.awaitedGroup = null;
+  }
+
   render(ensureFocus = true): void {
     const tabs = PlaylistService.playlistTabs;
     // The selected playlist may have just been deleted in settings — fall back to All.
     if (this.currentPlaylist && !tabs.some(t => t.id === this.currentPlaylist)) this.currentPlaylist = '';
     const showTabs = tabs.length > 1;
     const groups = this.getGroupEntries();
-    if (!groups.some(group => group.id === this.currentGroup)) this.currentGroup = 'builtin:all';
+    if (this.awaitedGroup && groups.some(group => group.id === this.awaitedGroup)) {
+      this.currentGroup = this.awaitedGroup;
+      this.awaitedGroup = null;
+    }
+    if (!groups.some(group => group.id === this.currentGroup)) {
+      if (!PlaylistService.complete) this.awaitedGroup = this.currentGroup;
+      this.currentGroup = 'builtin:all';
+    }
+    if (PlaylistService.complete) this.awaitedGroup = null;
     if (ensureFocus || this.recentItems.length === 0) {
       this.recentItems = RecentlyWatchedService.getItems(this.currentPlaylist || undefined);
     }
@@ -317,16 +334,15 @@ export class ChannelList {
     }
     if (previousGroupList) this.groupVirtualizer.setScrollOffset(previousGroupList.scrollTop);
     const viewportHeight = previousMain?.clientHeight || CHANNEL_VIEWPORT_FALLBACK;
-    let wantedPosition = filteredChannels.findIndex(
-      ch => `ch:${String(PlaylistService.indexOf(ch))}` === wantedKey,
-    );
+    const wantedIndex = wantedKey && wantedKey.startsWith('ch:')
+      ? Number(wantedKey.slice(3)) : NaN;
+    let wantedPosition = `ch:${String(wantedIndex)}` === wantedKey
+      ? positionOfGlobal(filteredChannels, wantedIndex) : -1;
     if (!showingRecent && ensureFocus && wantedPosition >= 0) {
       this.channelVirtualizer.ensureVisible(wantedPosition, viewportHeight);
     } else if (!showingRecent && ensureFocus && !wantedKey && !this.detachedKey()
         && this.playingIndex >= 0) {
-      wantedPosition = filteredChannels.findIndex(
-        ch => PlaylistService.indexOf(ch) === this.playingIndex,
-      );
+      wantedPosition = positionOfGlobal(filteredChannels, this.playingIndex);
       if (wantedPosition >= 0) this.channelVirtualizer.centerOn(wantedPosition, viewportHeight);
     }
     const range = this.channelVirtualizer.getRange(filteredChannels.length, viewportHeight);
@@ -352,7 +368,8 @@ export class ChannelList {
           : ''}">
         <div class="sidebar" data-nav-container>
           <div class="sidebar-header">
-            <div class="channel-count">${tp('channel.count', totalChannels)}</div>
+            <div class="channel-count">${
+              this.loadingChannels && !totalChannels ? '' : tp('channel.count', totalChannels)}</div>
             ${editing || showingRecent
               ? html`<div class="channel-edit-btn-spacer" aria-hidden="true"></div>`
               : html`
@@ -393,7 +410,8 @@ export class ChannelList {
               ? (this.recentItems.length
                   ? this.recentItems.map((item, index) =>
                     this.renderRecentItem(item, index, favs))
-                  : html`<div class="empty-state">${t('channel.recentEmpty')}</div>`)
+                  : html`<div class="empty-state">${
+                    t(this.loadingChannels ? 'app.loadingChannels' : 'channel.recentEmpty')}</div>`)
               : (filteredChannels.length
                   ? html`
                     <div class="channel-list-spacer" data-key="channel-list-spacer"
@@ -408,7 +426,8 @@ export class ChannelList {
                     </div>
                   `
                   : html`<div class="empty-state">${
-                    t(allSourcesDisabled ? 'channel.noEnabledSources' : 'channel.empty')
+                    t(this.loadingChannels ? 'app.loadingChannels'
+                      : allSourcesDisabled ? 'channel.noEnabledSources' : 'channel.empty')
                   }</div>`)}
           </div>
         </div>
@@ -587,7 +606,16 @@ export class ChannelList {
   }
 
   enterEditMode(group: ChannelGroupId = this.currentGroup): void {
-    this.authorizeEdit(() => this.editor.enterEditMode(group));
+    // A move made on a partial list would save an order missing the rest.
+    const partial = (): boolean => {
+      if (!PlaylistService.complete) showToast(t('app.loadingChannels'));
+      return !PlaylistService.complete;
+    };
+    if (partial()) return;
+    // A PIN prompt can outlast the check, so it runs again once the PIN is in.
+    this.authorizeEdit(() => {
+      if (!partial()) this.editor.enterEditMode(group);
+    });
   }
 
   exitEditMode(): void {
@@ -665,10 +693,10 @@ export class ChannelList {
           this.editor.enterFavoriteManagement();
         } else if (focused.dataset.playlist !== undefined) {
           this.currentPlaylist = focused.dataset.playlist;
-          this.currentGroup = 'builtin:all';
+          this.selectGroup('builtin:all');
           this.render();
         } else if (focused.dataset.group !== undefined) {
-          this.currentGroup = focused.dataset.group as ChannelGroupId;
+          this.selectGroup(focused.dataset.group as ChannelGroupId);
           this.render();
         } else if (focused.dataset.recentIndex !== undefined) {
           const item = this.recentItems[parseInt(focused.dataset.recentIndex, 10)];
@@ -832,6 +860,11 @@ export class ChannelList {
     `;
   }
 
+  // While a load has shown nothing yet, the empty list says so.
+  setLoading(loading: boolean): void {
+    this.loadingChannels = loading;
+  }
+
   setPlaying(idx: number, catchupStart?: number | null): void {
     // Stopping playback tunes nothing for the list to land on.
     const moved = idx >= 0 && idx !== this.playingIndex;
@@ -847,9 +880,10 @@ export class ChannelList {
   }
 
   private channelPosition(globalIdx: number): number {
-    return PlaylistService
-      .getByGroup(this.currentGroup, this.currentPlaylist || undefined)
-      .findIndex(ch => PlaylistService.indexOf(ch) === globalIdx);
+    return positionOfGlobal(
+      PlaylistService.getByGroup(this.currentGroup, this.currentPlaylist || undefined),
+      globalIdx,
+    );
   }
 
   // A channel named by global index can sit outside the current filter and
@@ -857,7 +891,7 @@ export class ChannelList {
   private revealChannel(globalIdx: number): boolean {
     let position = this.channelPosition(globalIdx);
     if (position < 0 && this.currentGroup !== 'builtin:all') {
-      this.currentGroup = 'builtin:all';
+      this.selectGroup('builtin:all');
       position = this.channelPosition(globalIdx);
     }
     if (position < 0 && this.currentPlaylist) {
@@ -1004,7 +1038,7 @@ export class ChannelList {
         </div>
         ${this.editor.renderChannelEditStatus(ch)}
         ${this.renderHealth(ch)}
-        ${isPlaying ? raw('<div class="playing-indicator">&#9654;</div>') : ''}
+        ${isPlaying ? raw(PLAYING_INDICATOR) : ''}
       </div>
     `;
   }
@@ -1034,7 +1068,7 @@ export class ChannelList {
           </div>
           ${this.renderHealth(item.channel)}
           <div class="recent-kind-badge live">${t('common.live')}</div>
-          ${isPlaying ? raw('<div class="playing-indicator">&#9654;</div>') : ''}
+          ${isPlaying ? raw(PLAYING_INDICATOR) : ''}
         </div>
       `;
     }
@@ -1063,7 +1097,7 @@ export class ChannelList {
           <div class="recent-progress"><div class="recent-progress-fill" style="width:${percent}%"></div></div>
         </div>
         <div class="recent-kind-badge catchup">${t('common.catchup')}</div>
-        ${isPlaying ? raw('<div class="playing-indicator">&#9654;</div>') : ''}
+        ${isPlaying ? raw(PLAYING_INDICATOR) : ''}
       </div>
     `;
   }
@@ -1337,4 +1371,13 @@ export class ChannelList {
 // matter. Avoids relying on `CSS.escape` which jsdom does not implement.
 function attrSelectorEscape(s: string): string {
   return s.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+}
+
+// The position in `list` of the channel at a global index, without a lookup
+// per entry of a list that may hold every channel.
+function positionOfGlobal(list: readonly Channel[], globalIdx: number): number {
+  const channel = PlaylistService.getByIndex(globalIdx);
+  return channel && PlaylistService.indexOf(channel) === globalIdx
+    ? list.indexOf(channel)
+    : -1;
 }

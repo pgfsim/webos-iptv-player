@@ -3,6 +3,9 @@ import {
   createXtreamClient,
   isXtreamRequestCancelled,
   XtreamRequestError,
+  type SyncCatalogOptions,
+  type SyncedCatalog,
+  type WholeCatalogOptions,
 } from './xtream-client';
 import {
   catalogCacheGeneration,
@@ -10,22 +13,13 @@ import {
   getCachedCatalogMetadata,
   setCachedCatalog,
   setCachedCatalogState,
-  type CachedCatalogEntry,
   type CachedCatalogMetadata,
   type CatalogListState,
 } from './idb-cache';
-import {
-  SERIES_CATALOG_RESOURCE,
-  SERIES_RESOURCE,
-  VOD_CATALOG_RESOURCE,
-  VOD_STREAMS_RESOURCE,
-} from './idb-schema';
-import {
-  CatalogTable,
-  isCatalogColumns,
-  sameCatalogColumns,
-  type CatalogColumns,
-} from './catalog-table';
+import { CATALOG_STORE, SERIES_RESOURCE, VOD_STREAMS_RESOURCE } from './idb-schema';
+import { releaseHeldRecord } from './held-records';
+import type { SearchCacheRecord } from '../workers/tasks';
+import { sameCatalogItems } from '../utils/catalog-items';
 import { CONFIG } from '../config';
 import { createLogger } from '../utils/logger';
 import { StorageService } from './storage-service';
@@ -61,17 +55,12 @@ function listExpiresAt(cached: CachedCatalogMetadata): number {
 export async function getSearchCatalogExpiresAt(
   accountId: string,
 ): Promise<number | null> {
-  const expiresAt = (key: string) => {
-    const held = heldCatalog(key);
-    if (held) return Promise.resolve(held.fetchedAt + StorageService.getXtreamCatalogRefreshIntervalMs());
-    return getCachedCatalogMetadata(key).then(cached => cached ? listExpiresAt(cached) : null);
-  };
   const [vod, series] = await Promise.all([
-    expiresAt(`${accountId}|${VOD_CATALOG_RESOURCE}`),
-    expiresAt(`${accountId}|${SERIES_CATALOG_RESOURCE}`),
+    getCachedCatalogMetadata(`${accountId}|vod_all`),
+    getCachedCatalogMetadata(`${accountId}|series_all`),
   ]);
-  if (vod === null || series === null) return null;
-  return Math.min(vod, series);
+  if (!vod || !series) return null;
+  return Math.min(listExpiresAt(vod), listExpiresAt(series));
 }
 
 function resourceFor(key: string): string {
@@ -91,28 +80,36 @@ function ensureCatalogActive(generation: number, signal?: AbortSignal): void {
   }
 }
 
-interface CatalogListResult<D> {
-  data: D;
+interface CatalogListResult<T> {
+  /** For a list kept in the worker, an empty stand-in that caches it. */
+  data: T[];
+  /** Item count when `data` is a stand-in. */
+  count?: number;
   state?: CatalogListState;
   unchanged?: boolean;
 }
 
-// A list is an item array, or a whole catalog stored by column.
-type ListData = { length: number };
+// A cached list's version; `data` only when the caller loaded the list.
+type CatalogSnapshot<T> = CachedCatalogMetadata & { data?: T[] };
 
-type RefetchList<D extends ListData> = (
+type RefetchList<T> = (
   signal?: AbortSignal,
-  cached?: CachedCatalogEntry<D>,
-) => Promise<D | CatalogListResult<D>>;
+  cached?: CatalogSnapshot<T>,
+) => Promise<T[] | CatalogListResult<T>>;
 
-function listResult<D extends ListData>(result: D | CatalogListResult<D>): CatalogListResult<D> {
-  return Array.isArray(result) ? { data: result } : result as CatalogListResult<D>;
+function listResult<T>(result: T[] | CatalogListResult<T>): CatalogListResult<T> {
+  return Array.isArray(result) ? { data: result } : result;
 }
 
-async function storeList<D extends ListData>(key: string, result: CatalogListResult<D>): Promise<void> {
+function listCount(result: CatalogListResult<unknown>): number {
+  return result.count ?? result.data.length;
+}
+
+function storeList<T>(key: string, result: CatalogListResult<T>): Promise<number | null> {
   const ttl = StorageService.getXtreamCatalogRefreshIntervalMs();
-  if (result.state) await setCachedCatalog(key, result.data, ttl, result.state);
-  else await setCachedCatalog(key, result.data, ttl);
+  return result.state
+    ? setCachedCatalog(key, result.data, ttl, result.state)
+    : setCachedCatalog(key, result.data, ttl);
 }
 
 const queuedRefreshKeys = new Set<string>();
@@ -163,10 +160,10 @@ export function onCatalogListRefreshed(listener: (key: string, changed?: boolean
 
 // Refresh independently of the view. Unchanged catalogs only renew freshness,
 // preserving the payload version and its prepared worker index.
-function refreshListInBackground<D extends ListData>(
+function refreshListInBackground<T>(
   key: string,
-  cached: CachedCatalogEntry<D>,
-  refetch: RefetchList<D>,
+  cached: CatalogSnapshot<T>,
+  refetch: RefetchList<T>,
   allowEmpty: boolean,
 ): void {
   if (queuedRefreshKeys.has(key)) return;
@@ -176,20 +173,25 @@ function refreshListInBackground<D extends ListData>(
     try {
       if (generation !== catalogCacheGeneration()) return;
       const result = listResult(await refetch(undefined, cached));
-      const { data } = result;
-      if (generation !== catalogCacheGeneration()) return;
-      if (!data.length && !result.state && !allowEmpty) {
+      if (generation !== catalogCacheGeneration()) {
+        releaseHeldRecord(result.data);
+        return;
+      }
+      const count = listCount(result);
+      if (!count && !result.state && !allowEmpty) {
         log.warn(
           'Catalog refresh was empty; keeping stale data',
           'event=xtream.catalog.stale',
           `resource=${resourceFor(key)}`,
           'reason=empty',
-          `items=${cached.data.length}`,
+          `items=${cached.data?.length ?? 'unloaded'}`,
         );
+        releaseHeldRecord(result.data);
         return;
       }
       // Legacy snapshots need one write to acquire the list-state marker.
       if (result.unchanged && result.state && cached.state) {
+        releaseHeldRecord(result.data);
         const accepted = await setCachedCatalogState(
           key, cached.timestamp, result.state, StorageService.getXtreamCatalogRefreshIntervalMs(),
         );
@@ -202,7 +204,7 @@ function refreshListInBackground<D extends ListData>(
         return;
       }
       await storeList(key, result);
-      log.debug('refreshed', key, `(${data.length})`);
+      log.debug('refreshed', key, `(${count})`);
       if (generation !== catalogCacheGeneration()) return;
       notifyListWritten(key);
       for (const listener of refreshListeners) listener(key);
@@ -213,7 +215,7 @@ function refreshListInBackground<D extends ListData>(
         'event=xtream.catalog.stale',
         `resource=${resourceFor(key)}`,
         'reason=request_failed',
-        `items=${cached.data.length}`,
+        `items=${cached.data?.length ?? 'unloaded'}`,
         err,
       );
     } finally {
@@ -225,18 +227,17 @@ function refreshListInBackground<D extends ListData>(
 
 // Serve any cached list at once, re-fetching an expired one in the background;
 // only a cold cache waits on the network.
-async function cachedList<D extends ListData>(
+async function cachedList<T>(
   key: string,
   signal: AbortSignal | undefined,
-  refetch: RefetchList<D>,
+  refetch: RefetchList<T>,
   allowEmpty = false,
-  valid: (data: unknown) => boolean = Array.isArray,
-): Promise<D> {
+): Promise<T[]> {
   const generation = catalogCacheGeneration();
   ensureCatalogActive(generation, signal);
-  const cached = await getCachedCatalog<D>(key);
+  const cached = await getCachedCatalog<T[]>(key);
   ensureCatalogActive(generation, signal);
-  if (cached && valid(cached.data)) {
+  if (cached) {
     if (Date.now() >= listExpiresAt(cached)) refreshListInBackground(key, cached, refetch, allowEmpty);
     log.debug('hit', key, `(${cached.data.length})`);
     return cached.data;
@@ -256,6 +257,45 @@ async function cachedList<D extends ListData>(
     `resource=${resourceFor(key)}`,
   );
   return data;
+}
+
+// cachedList for a list the worker keeps: the page gets the cached record's
+// version, never its items. Null when there is no worker or the list could
+// not be cached; the caller then loads the list itself.
+async function syncedList<T>(
+  key: string,
+  signal: AbortSignal | undefined,
+  refetch: RefetchList<T>,
+): Promise<SearchCacheRecord | null> {
+  const generation = catalogCacheGeneration();
+  ensureCatalogActive(generation, signal);
+  const cached = await getCachedCatalogMetadata(key);
+  ensureCatalogActive(generation, signal);
+  if (cached) {
+    if (Date.now() >= listExpiresAt(cached)) refreshListInBackground(key, cached, refetch, false);
+    return { store: CATALOG_STORE, key, timestamp: cached.timestamp };
+  }
+  const result = listResult(await refetch(signal));
+  try {
+    ensureCatalogActive(generation, signal);
+  } catch (error) {
+    releaseHeldRecord(result.data);
+    throw error;
+  }
+  if (!listCount(result) && !result.state) {
+    log.warn(
+      'Catalog returned no items and has no cache',
+      'event=xtream.catalog.empty',
+      `resource=${resourceFor(key)}`,
+    );
+    releaseHeldRecord(result.data);
+    return null;
+  }
+  const timestamp = await storeList(key, result);
+  if (timestamp === null) return null;
+  log.debug('synced', key, `(${listCount(result)})`);
+  notifyListWritten(key);
+  return { store: CATALOG_STORE, key, timestamp };
 }
 
 // Single-object variant of cachedList: caches a truthy result, otherwise serves
@@ -381,163 +421,524 @@ export function loadSeriesInfo(
   );
 }
 
-// Unfiltered lists download one at a time: two in flight at once can hold
-// enough memory for webOS to kill the app.
-let wholeCatalogQueue: Promise<void> = Promise.resolve();
+type CatalogPartition<T> =
+  | { ok: true; data: T[]; expiresAt: number }
+  | { ok: false; data: T[]; available: boolean; error: unknown; deferred: boolean };
 
-function takeWholeCatalogTurn(): Promise<() => void> {
-  let release = (): void => undefined;
-  const done = new Promise<void>(resolve => { release = resolve; });
-  const turn = wholeCatalogQueue.then(() => release);
-  wholeCatalogQueue = wholeCatalogQueue.then(() => done);
-  return turn;
+interface CatalogLoadContext {
+  generation: number;
+  signal: AbortSignal | undefined;
+  requestSignal: AbortSignal;
+  timedOut: () => boolean;
 }
 
-// The search catalog is one unfiltered request per list, as other Xtream
-// players make it. A failed list is not loaded by category instead: on a
-// large panel that is hundreds of requests per search, enough for providers
-// to block the account. It is asked for again after WHOLE_CATALOG_RETRY_MS.
-async function fetchWholeCatalog(
+const partitionQueue: Array<() => void> = [];
+let activePartitions = 0;
+
+function pumpPartitions(): void {
+  while (activePartitions < CONFIG.XTREAM.CATALOG_LOAD_CONCURRENCY && partitionQueue.length) {
+    partitionQueue.shift()!();
+  }
+}
+
+function requestPartition<T>(signal: AbortSignal, request: () => Promise<T[]>): Promise<T[]> {
+  return new Promise((resolve, reject) => {
+    const cancelled = (): void => {
+      const index = partitionQueue.indexOf(run);
+      if (index >= 0) partitionQueue.splice(index, 1);
+      signal.removeEventListener('abort', cancelled);
+      reject(new XtreamRequestError('cancelled', 'Catalog request was cancelled'));
+    };
+    const run = (): void => {
+      signal.removeEventListener('abort', cancelled);
+      if (signal.aborted) {
+        cancelled();
+        return;
+      }
+      activePartitions++;
+      const done = (): void => {
+        activePartitions--;
+        pumpPartitions();
+      };
+      Promise.resolve().then(request).then(resolve, reject).then(done, done);
+    };
+    if (signal.aborted) {
+      cancelled();
+      return;
+    }
+    signal.addEventListener('abort', cancelled);
+    partitionQueue.push(run);
+    pumpPartitions();
+  });
+}
+
+async function fetchPartition<T>(
+  key: string,
+  context: CatalogLoadContext,
+  refetch: (signal?: AbortSignal) => Promise<T[]>,
+  previous?: T[],
+  keepStaleOnEmpty = false,
+): Promise<CatalogPartition<T>> {
+  const { generation, signal } = context;
+  const cached = await getCachedCatalog<T[]>(key);
+  ensureCatalogActive(generation, signal);
+  if (cached && fresh(cached.timestamp)) {
+    return { ok: true, data: cached.data, expiresAt: listExpiresAt(cached) };
+  }
+  const stale = cached?.data ?? previous;
+  const budgetError = (): XtreamRequestError =>
+    new XtreamRequestError('timeout', 'Catalog load exceeded its time budget');
+  if (context.timedOut()) {
+    return {
+      ok: false, data: stale ?? [], available: stale !== undefined,
+      error: budgetError(), deferred: true,
+    };
+  }
+  let data: T[];
+  try {
+    data = await refetch(context.requestSignal);
+    ensureCatalogActive(generation, signal);
+    if (keepStaleOnEmpty && !data.length) {
+      if (stale?.length) {
+        log.warn(
+          'Catalog refresh was empty; keeping stale data',
+          'event=xtream.catalog.stale',
+          `resource=${resourceFor(key)}`,
+          'reason=empty',
+          `items=${stale.length}`,
+        );
+      }
+      throw new XtreamRequestError('request_failed', 'Catalog refresh returned no items');
+    }
+  } catch (error) {
+    ensureCatalogActive(generation, signal);
+    const deferred = context.timedOut();
+    if (isXtreamRequestCancelled(error) && !deferred) throw error;
+    return {
+      ok: false, data: stale ?? [], available: stale !== undefined,
+      error: deferred ? budgetError() : error, deferred,
+    };
+  }
+  const expiresAt = Date.now() + StorageService.getXtreamCatalogRefreshIntervalMs();
+  await setCachedCatalog(key, data, StorageService.getXtreamCatalogRefreshIntervalMs());
+  ensureCatalogActive(generation, signal);
+  notifyListWritten(key);
+  return { ok: true, data, expiresAt };
+}
+
+async function fetchWholeCatalog<T extends { categoryId: string }>(
   accountId: string,
   resource: 'vod_all' | 'series_all',
   signal: AbortSignal | undefined,
-  fetchColumns: (signal?: AbortSignal) => Promise<CatalogColumns>,
-  previous?: CatalogColumns,
-): Promise<CatalogListResult<CatalogColumns>> {
+  fetchItems: (categoryId: string, signal?: AbortSignal) => Promise<T[]>,
+  fetchCategories: (signal?: AbortSignal) => Promise<Array<{ id: string }>>,
+  itemId: (item: T) => string,
+  previous?: T[],
+  fetchAll?: WholeCatalogFetch<T>,
+): Promise<CatalogListResult<T>> {
   ensureActive(signal);
+  if (fetchAll) {
+    const whole = await fetchCatalogInOneRequest(
+      accountId, resource, signal, fetchAll, fetchCategories, previous,
+    );
+    if (whole) return whole;
+  }
+  const controller = new AbortController();
+  const deadline = Date.now() + CONFIG.XTREAM.CATALOG_LOAD_BUDGET_MS;
+  let expired = false;
+  const expire = (): void => {
+    expired = true;
+    controller.abort();
+  };
+  const cancel = (): void => controller.abort();
+  signal?.addEventListener('abort', cancel);
+  const timer = setTimeout(expire, CONFIG.XTREAM.CATALOG_LOAD_BUDGET_MS);
+  const context: CatalogLoadContext = {
+    generation: catalogCacheGeneration(),
+    signal,
+    requestSignal: controller.signal,
+    timedOut: () => {
+      if (!expired && Date.now() >= deadline) expire();
+      return expired;
+    },
+  };
+  try {
+    return await fetchCatalogPartitions(
+      accountId, resource, context, fetchItems, fetchCategories, itemId, previous,
+    );
+  } finally {
+    clearTimeout(timer);
+    signal?.removeEventListener('abort', cancel);
+    controller.abort();
+  }
+}
+
+// One streamed request instead of one per category: thousands of categories
+// otherwise take minutes. A failed or empty answer is retried after
+// WHOLE_CATALOG_RETRY_MS, never loaded per category instead: on a large panel
+// that is hundreds of requests, enough for a provider to block the account.
+type WholeCatalogFetch<T> = (
+  categoryIds: string[],
+  signal?: AbortSignal,
+  options?: WholeCatalogOptions,
+) => Promise<T[] | SyncedCatalog>;
+
+interface WholeList<T> {
+  data: T[] | null;
+  count: number;
+  unchanged?: boolean;
+}
+
+async function fetchCatalogInOneRequest<T extends { categoryId: string }>(
+  accountId: string,
+  resource: 'vod_all' | 'series_all',
+  signal: AbortSignal | undefined,
+  fetchAll: WholeCatalogFetch<T>,
+  fetchCategories: (signal?: AbortSignal) => Promise<Array<{ id: string }>>,
+  previous?: T[],
+): Promise<CatalogListResult<T> | null> {
   const generation = catalogCacheGeneration();
-  const failureKey = `${accountId}|${resource}`;
-  const failedAt = StorageService.getWholeCatalogRefusedAt(failureKey);
-  if (failedAt !== null && Date.now() - failedAt < CONFIG.XTREAM.WHOLE_CATALOG_RETRY_MS) {
+  const fallbackKey = `${accountId}|${resource}_whole`;
+  const fallback = await getCachedCatalog<{ code: string; retryAt?: number }>(fallbackKey);
+  ensureCatalogActive(generation, signal);
+  if (fallback && fresh(fallback.timestamp)
+    && !(typeof fallback.data.retryAt === 'number' && Date.now() >= fallback.data.retryAt)) {
     throw new XtreamRequestError('request_failed', 'Catalog list failed recently');
   }
-  let data: CatalogColumns;
-  const release = await takeWholeCatalogTurn();
+  const controller = new AbortController();
+  const cancel = (): void => controller.abort();
+  signal?.addEventListener('abort', cancel);
+  const context: CatalogLoadContext = {
+    generation,
+    signal,
+    requestSignal: controller.signal,
+    timedOut: () => false,
+  };
+  const oldCategories = Array.from(new Set((previous ?? []).map(item => item.categoryId)))
+    .filter(id => !!id)
+    .map(id => ({ id }));
   try {
-    ensureCatalogActive(generation, signal);
-    data = await fetchColumns(signal);
-    if (!data.length) throw new XtreamRequestError('request_failed', 'Catalog list was empty');
-  } catch (error) {
-    ensureCatalogActive(generation, signal);
-    if (isXtreamRequestCancelled(error)) throw error;
-    const reason = error instanceof XtreamRequestError ? error.code : 'request_failed';
-    log.warn(
-      'Catalog list failed; it will be requested again later',
-      'event=xtream.catalog.whole_failed',
-      `resource=${resource}`,
-      `reason=${reason}`,
-      `retryMs=${CONFIG.XTREAM.WHOLE_CATALOG_RETRY_MS}`,
+    // The worker orders the catalog by category, so it needs the ids first.
+    const categories = await fetchPartition(
+      `${accountId}|${resource === 'vod_all' ? 'vod_categories' : 'series_categories'}`,
+      context, fetchCategories,
+      oldCategories.length ? oldCategories : undefined,
+      true,
     );
-    StorageService.setWholeCatalogRefusedAt(failureKey, Date.now());
-    throw error;
+    ensureCatalogActive(generation, signal);
+    if (!categories.ok && !categories.available) throw categories.error;
+    const categoryIds = Array.from(new Set(categories.data.map(category => category.id)));
+    const whole = await fetchAll(categoryIds, controller.signal, {
+      keepUnknownCategories: !categories.ok,
+    }).then(
+      data => ({
+        ok: true as const,
+        list: Array.isArray(data) ? { data: data as T[] | null, count: data.length } : data as WholeList<T>,
+      }),
+      (error: unknown) => ({ ok: false as const, error }),
+    );
+    try {
+      ensureCatalogActive(generation, signal);
+    } catch (error) {
+      if (whole.ok) releaseHeldRecord(whole.list.data);
+      throw error;
+    }
+    let code: string | null = null;
+    if (!whole.ok) {
+      if (isXtreamRequestCancelled(whole.error)) throw whole.error;
+      code = whole.error instanceof XtreamRequestError ? whole.error.code : 'request_failed';
+    } else if (!whole.list.count && categoryIds.length) {
+      // Some panels answer an unfiltered request with an empty list.
+      code = 'empty';
+      releaseHeldRecord(whole.list.data);
+    }
+    if (code !== null) {
+      log.warn(
+        'Whole catalog request failed; it will be requested again later',
+        'event=xtream.catalog.whole_failed',
+        `resource=${resource}`,
+        `code=${code}`,
+        `retryMs=${CONFIG.XTREAM.WHOLE_CATALOG_RETRY_MS}`,
+      );
+      // Panels that answer empty or refuse often recover; asking again later
+      // costs one request, where per-category loads cost hundreds.
+      const marker = { code, retryAt: Date.now() + CONFIG.XTREAM.WHOLE_CATALOG_RETRY_MS };
+      await setCachedCatalog(fallbackKey, marker, StorageService.getXtreamCatalogRefreshIntervalMs());
+      ensureCatalogActive(generation, signal);
+      if (!whole.ok) throw whole.error;
+      throw new XtreamRequestError('request_failed', 'Catalog list was empty');
+    }
+    const list: WholeList<T> = whole.ok ? whole.list : { data: [], count: 0 };
+    const result = list.data ?? [];
+    const now = Date.now();
+    return {
+      data: result,
+      count: list.count,
+      unchanged: list.unchanged ?? (previous !== undefined && sameCatalogItems(previous, result)),
+      // Stale category ids put newer categories' items last; reorder later.
+      state: categories.ok
+        ? {
+          complete: true,
+          refreshAfter: now + StorageService.getXtreamCatalogRefreshIntervalMs(),
+          freshSince: now,
+        }
+        : { complete: false, refreshAfter: now + CONFIG.XTREAM.WHOLE_CATALOG_RETRY_MS },
+    };
   } finally {
-    release();
+    signal?.removeEventListener('abort', cancel);
+    controller.abort();
   }
+}
+
+async function fetchCatalogPartitions<T extends { categoryId: string }>(
+  accountId: string,
+  resource: 'vod_all' | 'series_all',
+  context: CatalogLoadContext,
+  fetchItems: (categoryId: string, signal?: AbortSignal) => Promise<T[]>,
+  fetchCategories: (signal?: AbortSignal) => Promise<Array<{ id: string }>>,
+  itemId: (item: T) => string,
+  previous?: T[],
+): Promise<CatalogListResult<T>> {
+  const { generation, signal } = context;
+  const oldPartitions = new Map<string, T[]>();
+  for (const item of previous ?? []) {
+    const partition = oldPartitions.get(item.categoryId);
+    if (partition) partition.push(item);
+    else oldPartitions.set(item.categoryId, [item]);
+  }
+  const categoryResource = resource === 'vod_all' ? 'vod_categories' : 'series_categories';
+  const itemResource = resource === 'vod_all' ? VOD_STREAMS_RESOURCE : SERIES_RESOURCE;
+  const oldCategories = Array.from(oldPartitions.keys())
+    .filter(id => !!id)
+    .map(id => ({ id }));
+  const cursorKey = `${accountId}|${resource}_cursor`;
+  const [categories, cursor] = await Promise.all([
+    fetchPartition(
+      `${accountId}|${categoryResource}`, context, fetchCategories,
+      oldCategories.length ? oldCategories : undefined,
+      true,
+    ),
+    getCachedCatalog<{ nextCategory: string }>(cursorKey),
+  ]);
   ensureCatalogActive(generation, signal);
-  const now = Date.now();
-  const ttl = StorageService.getXtreamCatalogRefreshIntervalMs();
+  if (!categories.ok && !categories.available) throw categories.error;
+  const categoryIds = Array.from(new Set(categories.data.map(category => category.id)));
+  const start = Math.max(0, categoryIds.indexOf(cursor?.data.nextCategory ?? ''));
+  const partitions = new Map<string, CatalogPartition<T>>();
+  let next = 0;
+  let lastStarted: string | null = null;
+  const load = async (): Promise<void> => {
+    while (next < categoryIds.length) {
+      const categoryId = categoryIds[(start + next++) % categoryIds.length];
+      ensureCatalogActive(generation, signal);
+      const partition = await fetchPartition(
+        `${accountId}|${itemResource}|${categoryId}`, context,
+        requestSignal => requestPartition(context.requestSignal, () => {
+          ensureCatalogActive(generation, signal);
+          ensureActive(context.requestSignal);
+          lastStarted = categoryId;
+          return fetchItems(categoryId, requestSignal);
+        }),
+        oldPartitions.get(categoryId),
+      );
+      partitions.set(categoryId, partition);
+    }
+  };
+  const loads: Array<Promise<void>> = [];
+  for (let i = 0; i < CONFIG.XTREAM.CATALOG_LOAD_CONCURRENCY; i++) loads.push(load());
+  await Promise.all(loads);
+  ensureCatalogActive(generation, signal);
+  const result: T[] = [];
+  const seen = new Set<string>();
+  let expiresAt = categories.ok ? categories.expiresAt : 0;
+  let failure = categories.ok ? null : { error: categories.error };
+  let failed = 0;
+  let stale = 0;
+  let available = 0;
+  let deferred = 0;
+  // Merge in server order, not completion order, so cached indexes stay stable.
+  for (const categoryId of categoryIds) {
+    const partition = partitions.get(categoryId)!;
+    if (partition.ok) {
+      available++;
+      expiresAt = Math.min(expiresAt, partition.expiresAt);
+    } else {
+      failed++;
+      if (partition.deferred) deferred++;
+      if (!failure) failure = { error: partition.error };
+      if (partition.available) {
+        available++;
+        stale++;
+      }
+    }
+    for (const item of partition.data) {
+      const id = itemId(item);
+      if (seen.has(id)) continue;
+      seen.add(id);
+      result.push(item);
+    }
+  }
+  if (failure) {
+    const budgetExhausted = context.timedOut();
+    if (budgetExhausted && categoryIds.length) {
+      // Rotate past attempted requests even if none succeeded, so slow early
+      // categories cannot starve the rest on every retry.
+      const resume = lastStarted === null ? start : (categoryIds.indexOf(lastStarted) + 1) % categoryIds.length;
+      await setCachedCatalog(cursorKey, { nextCategory: categoryIds[resume] },
+        StorageService.getXtreamCatalogRefreshIntervalMs());
+      ensureCatalogActive(generation, signal);
+    }
+    log.warn(
+      'Catalog is incomplete; failed partitions will be retried',
+      'event=xtream.catalog.partial',
+      `resource=${resource}`,
+      `categories=${categoryIds.length}`,
+      `failed=${failed}`,
+      `stale=${stale}`,
+      `missing=${failed - stale}`,
+      `categoryListFailed=${String(!categories.ok)}`,
+      `deferred=${deferred}`,
+      `budgetExhausted=${String(budgetExhausted)}`,
+    );
+    if (categoryIds.length && !available) throw failure.error;
+  }
   return {
-    data,
-    unchanged: previous !== undefined && sameCatalogColumns(previous, data),
-    state: { complete: true, refreshAfter: now + ttl, freshSince: now },
+    data: result,
+    unchanged: previous !== undefined && sameCatalogItems(previous, result),
+    state: {
+      complete: !failure,
+      refreshAfter: failure ? Date.now() + CONFIG.XTREAM.CATALOG_RETRY_DELAY_MS : expiresAt,
+      ...(!failure ? {
+        freshSince: expiresAt - StorageService.getXtreamCatalogRefreshIntervalMs(),
+      } : {}),
+    },
   };
 }
 
-// The latest whole catalog downloaded this session, by cache key. The cache
-// often has no room for one next to the channel list, so this copy serves it
-// until it expires instead of a download on every Search open.
-interface HeldCatalog {
-  columns: CatalogColumns;
-  fetchedAt: number;
-  generation: number;
+export function loadAllVodStreams(
+  account: PlaylistEntry,
+  signal?: AbortSignal,
+): Promise<VodItem[]> {
+  return cachedList(
+    `${account.id}|vod_all`,
+    signal,
+    (requestSignal, cached) => {
+      const client = clientFor(account);
+      return fetchWholeCatalog(
+        account.id,
+        'vod_all',
+        requestSignal,
+        client.getVodStreams,
+        client.getVodCategories,
+        item => item.streamId,
+        cached?.data,
+        typeof Worker === 'undefined' ? undefined : client.getAllVodStreams,
+      );
+    },
+  );
 }
 
-const heldCatalogs = new Map<string, HeldCatalog>();
-const wholeCatalogLoads = new Map<string, Promise<CatalogColumns>>();
-
-function heldCatalog(key: string): HeldCatalog | null {
-  const held = heldCatalogs.get(key);
-  if (!held) return null;
-  if (held.generation !== catalogCacheGeneration() || !fresh(held.fetchedAt)) {
-    heldCatalogs.delete(key);
-    return null;
-  }
-  return held;
+export function loadAllSeries(
+  account: PlaylistEntry,
+  signal?: AbortSignal,
+): Promise<SeriesItem[]> {
+  return cachedList(
+    `${account.id}|series_all`,
+    signal,
+    (requestSignal, cached) => {
+      const client = clientFor(account);
+      return fetchWholeCatalog(
+        account.id,
+        'series_all',
+        requestSignal,
+        client.getSeries,
+        client.getSeriesCategories,
+        item => item.seriesId,
+        cached?.data,
+        typeof Worker === 'undefined' ? undefined : client.getAllSeries,
+      );
+    },
+  );
 }
 
-function untilAborted<T>(work: Promise<T>, signal?: AbortSignal): Promise<T> {
-  if (!signal) return work;
-  ensureActive(signal);
-  return new Promise<T>((resolve, reject) => {
-    const abort = () => reject(new XtreamRequestError('cancelled', 'Xtream request was cancelled'));
-    signal.addEventListener('abort', abort);
-    work.then(resolve, reject).then(() => signal.removeEventListener('abort', abort));
-  });
-}
-
-// One load per key at a time, detached from the caller: a startup preload
-// and a Search open share one download, and closing Search keeps it going.
-function loadWholeCatalog(
+// The search's whole-catalog load: the list stays in the worker and its
+// cache write happens there. A panel that needs per-category loads gets
+// them through the page, as loadAll* would.
+function syncedRefetch<T extends { categoryId: string }>(
   account: PlaylistEntry,
   resource: 'vod_all' | 'series_all',
-  signal: AbortSignal | undefined,
-): Promise<CatalogColumns> {
-  ensureActive(signal);
-  const kind = resource === 'vod_all' ? 'vod' : 'series';
-  const key = `${account.id}|${kind === 'vod' ? VOD_CATALOG_RESOURCE : SERIES_CATALOG_RESOURCE}`;
-  const held = heldCatalog(key);
-  if (held) return Promise.resolve(held.columns);
-  let load = wholeCatalogLoads.get(key);
-  if (!load) {
-    const client = clientFor(account);
-    const fetchColumns = kind === 'vod' ? client.getVodCatalog : client.getSeriesCatalog;
-    load = cachedList<CatalogColumns>(
-      key,
-      undefined,
-      async (requestSignal, cached) => {
-        const generation = catalogCacheGeneration();
-        const result = await fetchWholeCatalog(account.id, resource, requestSignal, fetchColumns, cached?.data);
-        heldCatalogs.set(key, { columns: result.data, fetchedAt: Date.now(), generation });
-        return result;
-      },
-      false,
-      data => isCatalogColumns(data, kind),
+  sync: (categoryIds: string[], signal?: AbortSignal, options?: SyncCatalogOptions) => Promise<SyncedCatalog>,
+  fetchCategories: (signal?: AbortSignal) => Promise<Array<{ id: string }>>,
+  listRefetch: RefetchList<T>,
+): RefetchList<T> {
+  const key = `${account.id}|${resource}`;
+  return async (signal, cached) => {
+    // Only a list with a state can renew its freshness without a rewrite.
+    const previous = cached?.state ? { key, timestamp: cached.timestamp } : undefined;
+    const whole = await fetchCatalogInOneRequest<T>(
+      account.id, resource, signal,
+      (categoryIds, requestSignal, options) =>
+        sync(categoryIds, requestSignal, { ...options, ...(previous ? { previous } : {}) }),
+      fetchCategories,
     );
-    const settled = load;
-    wholeCatalogLoads.set(key, settled);
-    const forget = () => {
-      if (wholeCatalogLoads.get(key) === settled) wholeCatalogLoads.delete(key);
-    };
-    settled.then(forget, forget);
+    if (whole) return whole;
+    // The whole request just failed, so this loads per category.
+    const loaded = cached ? await getCachedCatalog<T[]>(key) : null;
+    return listRefetch(signal, loaded ?? undefined);
+  };
+}
+
+/** The cached movie catalog's record, synced off the UI thread; null means use loadAllVodStreams. */
+export function syncAllVodStreams(
+  account: PlaylistEntry,
+  signal?: AbortSignal,
+): Promise<SearchCacheRecord | null> {
+  if (typeof Worker === 'undefined') return Promise.resolve(null);
+  const client = clientFor(account);
+  return syncedList<VodItem>(
+    `${account.id}|vod_all`,
+    signal,
+    syncedRefetch<VodItem>(account, 'vod_all', client.syncAllVodStreams, client.getVodCategories,
+      (requestSignal, cached) => fetchWholeCatalog(
+        account.id, 'vod_all', requestSignal, client.getVodStreams, client.getVodCategories,
+        item => item.streamId, cached?.data,
+      )),
+  );
+}
+
+/** The cached series catalog's record, synced off the UI thread; null means use loadAllSeries. */
+export function syncAllSeries(
+  account: PlaylistEntry,
+  signal?: AbortSignal,
+): Promise<SearchCacheRecord | null> {
+  if (typeof Worker === 'undefined') return Promise.resolve(null);
+  const client = clientFor(account);
+  return syncedList<SeriesItem>(
+    `${account.id}|series_all`,
+    signal,
+    syncedRefetch<SeriesItem>(account, 'series_all', client.syncAllSeries, client.getSeriesCategories,
+      (requestSignal, cached) => fetchWholeCatalog(
+        account.id, 'series_all', requestSignal, client.getSeries, client.getSeriesCategories,
+        item => item.seriesId, cached?.data,
+      )),
+  );
+}
+
+/**
+ * Downloads the search catalogs into the worker shortly after startup, so
+ * Search finds them ready. They load one after the other, as Search would.
+ */
+export async function preloadSearchCatalog(account: PlaylistEntry): Promise<void> {
+  for (const sync of [syncAllVodStreams, syncAllSeries]) {
+    try {
+      await sync(account);
+    } catch (error) {
+      if (isXtreamRequestCancelled(error)) return;
+      log.info(
+        'Search catalog preload failed',
+        'event=xtream.catalog.preload.failed',
+        `reason=${error instanceof XtreamRequestError ? error.code : 'request_failed'}`,
+      );
+    }
   }
-  return untilAborted(load, signal);
-}
-
-export async function loadAllVodStreams(
-  account: PlaylistEntry,
-  signal?: AbortSignal,
-): Promise<CatalogTable<VodItem>> {
-  return new CatalogTable<VodItem>(await loadWholeCatalog(account, 'vod_all', signal));
-}
-
-export async function loadAllSeries(
-  account: PlaylistEntry,
-  signal?: AbortSignal,
-): Promise<CatalogTable<SeriesItem>> {
-  return new CatalogTable<SeriesItem>(await loadWholeCatalog(account, 'series_all', signal));
-}
-
-// Downloads the search catalog ahead of a Search open; a failure is left
-// for Search to report and is not asked again within the retry window.
-export function preloadSearchCatalog(account: PlaylistEntry): Promise<void> {
-  return Promise.all([
-    loadWholeCatalog(account, 'vod_all', undefined),
-    loadWholeCatalog(account, 'series_all', undefined),
-  ]).then(() => undefined, (error: unknown) => {
-    log.info(
-      'Search catalog preload failed',
-      'event=xtream.catalog.preload.failed',
-      `reason=${error instanceof XtreamRequestError ? error.code : 'request_failed'}`,
-    );
-  });
 }

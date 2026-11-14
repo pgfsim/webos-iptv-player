@@ -129,10 +129,6 @@ export const FR_MESSAGES = {
     one: '{count} série',
     other: '{count} séries',
   },
-  'catalog.episodeCount': {
-    one: '{count} épisode',
-    other: '{count} épisodes',
-  },
   'catalog.noMovies': 'Aucun film disponible pour ce compte.',
   'catalog.noMoviesCategory': 'Aucun film dans cette catégorie.',
   'catalog.noSeries': 'Aucune série disponible pour ce compte.',
@@ -195,6 +191,8 @@ export const FR_MESSAGES = {
     other: 'Début dans {count} secondes',
   },
   'player.playNow': 'Lire maintenant',
+  'player.previousEpisode': 'Épisode précédent',
+  'player.nextEpisode': 'Épisode suivant',
   'player.unableToPlay': 'Impossible de lire cette vidéo.',
   'player.reconnecting': 'Reconnexion…',
   'player.retryingCatchup': 'Nouvelle tentative de lecture du replay…',
@@ -508,7 +506,6 @@ export const FR_MESSAGES = {
   'parental.askAfterLeaving': 'Après avoir quitté l’app',
   'app.welcome': 'Bienvenue ! Ajoutez l’URL d’une liste de lecture pour commencer.',
   'app.loadingChannels': 'Chargement des chaînes…',
-  'app.loadingChannelsProgress': 'Chargement des chaînes… Entrées traitées : {processed} ; conservées : {kept}',
   'app.channelsLoaded': {
     one: '{count} chaîne chargée',
     other: '{count} chaînes chargées',

@@ -4,8 +4,8 @@ import {
   EPG_STORE,
   PLAYLIST_STORE,
 } from '../services/idb-schema';
-import { isCatalogColumns, packedValue } from '../services/catalog-table';
 import { foldSearchText } from '../utils/channel-search';
+import { isPackedEpg, unpackEpg } from '../services/epg-cache-codec';
 import { SearchCacheError, type CachedRecord } from './search-cache-reader';
 import type { SearchCacheRecord, SearchIndexCandidate } from './tasks';
 
@@ -67,7 +67,8 @@ function listOf(value: unknown): unknown[] {
 export function buildSourceIndex(ref: SearchCacheRecord, raw: CachedRecord | null): SourceIndex {
   if (!raw) throw new SearchCacheError('record_missing');
   if (cacheRecordTimestamp(raw) !== ref.timestamp) throw new SearchCacheError('record_changed');
-  const data: unknown = raw.data;
+  const stored: unknown = raw.data;
+  const data: unknown = isPackedEpg(stored) ? unpackEpg(stored) : stored;
   const values: string[] = [];
   let length = 0;
   let runIds: string[] | undefined;
@@ -101,9 +102,6 @@ export function buildSourceIndex(ref: SearchCacheRecord, raw: CachedRecord | nul
       runCounts.push(list.length);
       length += list.length;
     }
-  } else if (isCatalogColumns(data, 'vod') || isCatalogColumns(data, 'series')) {
-    for (let i = 0; i < data.length; i++) values.push(foldSearchText(packedValue(data.names, i)));
-    length = data.length;
   } else {
     const items = listOf(data);
     for (const item of items) values.push(foldSearchText(text(fieldsOf(item).name)));

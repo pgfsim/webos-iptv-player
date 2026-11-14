@@ -30,6 +30,10 @@
   --catalog-focus-rgb: 91 140 255;
   --catalog-hero-scrim-rgb: 10 10 15;
   --catalog-sort-selected-bg: #007e9e;
+  /* The cards fanned behind a Continue Watching series tile. */
+  --catalog-stack: var(--text-muted);
+  --catalog-stack-near-opacity: 0.7;
+  --catalog-stack-far-opacity: 0.4;
   --focus-ring: var(--accent);
   --radius: 8px;
   --transition: 0.2s ease;
@@ -107,7 +111,8 @@ html[data-animation="essential"] .tab-bar-search-input,
 html[data-animation="essential"] .channel-scroll-thumb,
 html[data-animation="essential"] .epg-mapping-list,
 html[data-animation="essential"] .channel-health-progress-fill,
-html[data-animation="essential"] .osd-progress-bar {
+html[data-animation="essential"] .osd-progress-bar,
+html[data-animation="essential"] .tab-bar-progress-fill {
   transition-duration: 0.001ms !important;
 }
 
@@ -183,34 +188,6 @@ h3 {
   font-weight: 500;
   color: var(--text-secondary);
   margin-bottom: 12px;
-}
-
-/* Loading */
-.loading-container {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  height: 100%;
-  gap: 24px;
-}
-
-.loading-spinner {
-  width: 64px;
-  height: 64px;
-  border: 4px solid var(--border);
-  border-top-color: var(--accent);
-  border-radius: 50%;
-  animation: spin 0.8s linear infinite;
-}
-
-@keyframes spin {
-  to { transform: rotate(360deg); }
-}
-
-.loading-text {
-  font-size: 28px;
-  color: var(--text-secondary);
 }
 
 /* Buttons */

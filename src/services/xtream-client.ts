@@ -1,10 +1,11 @@
-import { FetchTextError, fetchLimitedText, fetchLimitedTextStream } from '../utils/fetch-helper';
-import { JsonArrayStream, JsonArrayStreamError } from '../utils/json-array-stream';
-import { CatalogColumnsBuilder, type CatalogColumns } from './catalog-table';
+import { FetchTextError, fetchLimitedText } from '../utils/fetch-helper';
 import { xtreamPlayerApi, type XtreamCredentials } from '../utils/xtream-url';
 import { createLogger } from '../utils/logger';
 import type { VodCategory, VodItem, VodInfo, SeriesCategory, SeriesItem, SeriesInfo, Episode, SidecarSubtitle } from '../types';
 import { CONFIG } from '../config';
+import { runAppWorkerTask } from '../workers/app-worker-client';
+import type { XtreamCatalogStreamResponse } from './xtream-catalog-stream';
+import { holdWorkerValue } from './worker-held-records';
 
 const log = createLogger('Xtream');
 
@@ -181,7 +182,7 @@ function logRequestFailure(
   );
 }
 
-async function fetchJsonStrict(
+async function fetchJsonValue(
   url: string,
   timeout: number,
   maxBytes: number,
@@ -191,18 +192,106 @@ async function fetchJsonStrict(
   try {
     text = await fetchLimitedText(url, maxBytes, timeout, signal);
   } catch (err) {
-    const requestError = mapFetchError(err);
-    logRequestFailure(url, requestError, timeout, maxBytes);
-    throw requestError;
+    throw mapFetchError(err);
   }
   try {
     return JSON.parse(text);
   } catch {
-    const requestError =
-      new XtreamRequestError('invalid_json', 'Xtream response was not valid JSON');
-    logRequestFailure(url, requestError, timeout, maxBytes);
-    throw requestError;
+    throw new XtreamRequestError('invalid_json', 'Xtream response was not valid JSON');
   }
+}
+
+async function fetchJsonStrict(
+  url: string,
+  timeout: number,
+  maxBytes: number,
+  signal?: AbortSignal,
+): Promise<unknown> {
+  try {
+    return await fetchJsonValue(url, timeout, maxBytes, signal);
+  } catch (err) {
+    if (err instanceof XtreamRequestError) logRequestFailure(url, err, timeout, maxBytes);
+    throw err;
+  }
+}
+
+export interface XtreamLiveStreamsRequest {
+  url: string;
+  timeout: number;
+  maxBytes: number;
+}
+
+export interface XtreamLiveStreamsResponse extends XtreamLiveCatalogResult {
+  failure?: XtreamRequestErrorCode;
+}
+
+/** Worker side of `getLiveStreamsResult`: never throws, so the main thread logs. */
+export async function loadLiveStreamsCatalog(
+  request: XtreamLiveStreamsRequest,
+): Promise<XtreamLiveStreamsResponse> {
+  try {
+    const value = await fetchJsonValue(request.url, request.timeout, request.maxBytes);
+    return { available: Array.isArray(value), streams: parseLiveStreams(value) };
+  } catch (err) {
+    return {
+      available: false,
+      streams: [],
+      failure: err instanceof XtreamRequestError ? err.code : 'request_failed',
+    };
+  }
+}
+
+export type XtreamClockFailure = XtreamRequestErrorCode | 'no_server_info';
+
+export interface XtreamServerClockResult {
+  clock: XtreamServerClock | null;
+  failure?: XtreamClockFailure;
+}
+
+/** Worker side of `getServerClock`: never throws or logs, so the page logs why. */
+export async function loadServerClockResult(
+  creds: XtreamCredentials,
+  signal?: AbortSignal,
+): Promise<XtreamServerClockResult> {
+  let data: unknown;
+  try {
+    data = await fetchJsonValue(
+      xtreamPlayerApi(creds),
+      ACCOUNT_INFO_TIMEOUT,
+      CONFIG.XTREAM.ACCOUNT_MAX_BYTES,
+      signal,
+    );
+  } catch (err) {
+    return {
+      clock: null,
+      failure: err instanceof XtreamRequestError ? err.code : 'request_failed',
+    };
+  }
+  const clock = serverClockFrom(data);
+  return clock ? { clock } : { clock: null, failure: 'no_server_info' };
+}
+
+async function loadServerClock(
+  creds: XtreamCredentials,
+  signal?: AbortSignal,
+): Promise<XtreamServerClock | null> {
+  return serverClockFrom(await fetchJson(
+    xtreamPlayerApi(creds),
+    ACCOUNT_INFO_TIMEOUT,
+    CONFIG.XTREAM.ACCOUNT_MAX_BYTES,
+    signal,
+  ));
+}
+
+function serverClockFrom(data: unknown): XtreamServerClock | null {
+  if (!data || typeof data !== 'object') return null;
+  const server = (data as { server_info?: unknown }).server_info;
+  if (!server || typeof server !== 'object') return null;
+  const record = server as Record<string, unknown>;
+  return {
+    timeZone: toStr(record.timezone),
+    offsetMinutes: parseServerOffset(record),
+  };
 }
 
 // Tolerant metadata callers model unsupported endpoints as null/empty.
@@ -221,113 +310,230 @@ async function fetchJson(
   }
 }
 
-// Catalog lists are parsed one element at a time as they download and mapped
-// at once to the few fields the app keeps, so a list of tens of megabytes
-// never sits in memory as one string or as its raw parsed objects.
-async function streamCatalogList(
+async function fetchCatalogArray(
   url: string,
   maxBytes: number,
-  timeout: number,
   idField: 'category_id' | 'stream_id' | 'series_id',
-  onItem: (item: Record<string, unknown>) => void,
   signal?: AbortSignal,
-): Promise<void> {
-  let objects = 0;
-  let withId = 0;
-  const parser = new JsonArrayStream(value => {
-    if (!value || typeof value !== 'object' || Array.isArray(value)) return;
-    const item = value as Record<string, unknown>;
-    objects++;
-    if (toStr(item[idField]) !== '') withId++;
-    onItem(item);
-  });
-  try {
-    await fetchLimitedTextStream(url, maxBytes, timeout, signal, text => parser.push(text));
-    parser.finish();
-  } catch (err) {
-    const requestError = err instanceof JsonArrayStreamError
-      ? err.code === 'not_array'
-        ? new XtreamRequestError('request_failed', 'Xtream catalog response was not a valid list')
-        : new XtreamRequestError('invalid_json', 'Xtream response was not valid JSON')
-      : mapFetchError(err);
-    logRequestFailure(url, requestError, timeout, maxBytes);
-    throw requestError;
-  }
-  if (objects && !withId) {
+): Promise<Record<string, unknown>[]> {
+  const data = await fetchJsonStrict(url, CATALOG_TIMEOUT, maxBytes, signal);
+  const items = asArray(data);
+  if (!Array.isArray(data) || (data.length && !items.some(item => toStr(item[idField]) !== ''))) {
     const error = new XtreamRequestError('request_failed', 'Xtream catalog response was not a valid list');
-    logRequestFailure(url, error, timeout, maxBytes);
+    logRequestFailure(url, error, CATALOG_TIMEOUT, maxBytes);
     throw error;
   }
-}
-
-async function fetchCatalogList<T>(
-  url: string,
-  maxBytes: number,
-  timeout: number,
-  idField: 'category_id' | 'stream_id' | 'series_id',
-  map: (item: Record<string, unknown>) => T | null,
-  signal?: AbortSignal,
-): Promise<T[]> {
-  const items: T[] = [];
-  await streamCatalogList(url, maxBytes, timeout, idField, (item) => {
-    const mapped = map(item);
-    if (mapped !== null) items.push(mapped);
-  }, signal);
   return items;
 }
 
-function vodItem(accountId: string, s: Record<string, unknown>): VodItem | null {
-  const streamId = toStr(s.stream_id);
-  return streamId ? {
+interface SharedCatalogStream {
+  token: string;
+  task: Promise<XtreamCatalogStreamResponse>;
+  batches: unknown[][];
+  waiters: number;
+  settled: boolean;
+  // Every caller left, so a queued stream never starts.
+  abandoned?: boolean;
+  // Lets the next whole catalog start.
+  releaseTurn: () => void;
+  items?: unknown[];
+}
+
+// Callers asking for the same catalog at once share one download.
+const sharedCatalogStreams = new Map<string, SharedCatalogStream>();
+let nextCatalogStreamToken = 1;
+// Whole catalogs download one at a time, so a provider never serves two
+// lists of tens of megabytes to one account at once.
+let catalogStreamTail: Promise<void> | null = null;
+
+export interface WholeCatalogOptions {
+  keepUnknownCategories?: boolean;
+}
+
+export interface SyncCatalogOptions extends WholeCatalogOptions {
+  /** The cached list's version, compared in the worker. */
+  previous?: { key: string; timestamp: number };
+}
+
+/**
+ * A whole catalog the worker kept instead of sending. `data` is an empty
+ * stand-in that writes the worker's list when cached; it is null when the
+ * list matched `previous`.
+ */
+export interface SyncedCatalog {
+  data: never[] | null;
+  count: number;
+  unchanged: boolean;
+}
+
+// One request for a whole catalog, streamed and parsed off the UI thread.
+// The worker stops once every caller has aborted.
+async function streamCatalogInWorker<T>(
+  kind: 'vod' | 'series',
+  url: string,
+  accountId: string,
+  categoryIds: string[],
+  signal?: AbortSignal,
+  options: WholeCatalogOptions = {},
+): Promise<T[]> {
+  const { response, stream } = await joinCatalogStream(kind, url, accountId, categoryIds, signal, options, false);
+  if (!stream.items) {
+    const items: unknown[] = [];
+    for (const batch of stream.batches) {
+      for (let i = 0; i < batch.length; i++) items.push(batch[i]);
+    }
+    stream.batches.length = 0;
+    // Callers that shared the load share the list, so it is held once.
+    if (response.held) holdWorkerValue(items, response.held, false);
+    stream.items = items;
+  }
+  return stream.items as T[];
+}
+
+// The same load, but the list stays in the worker: the page gets only its
+// size, so a 200k-item catalog never crosses to the UI thread.
+async function syncCatalogInWorker(
+  kind: 'vod' | 'series',
+  url: string,
+  accountId: string,
+  categoryIds: string[],
+  signal?: AbortSignal,
+  options: SyncCatalogOptions = {},
+): Promise<SyncedCatalog> {
+  const { response, stream } = await joinCatalogStream(kind, url, accountId, categoryIds, signal, options, true);
+  if (!stream.items) {
+    const stand: never[] = [];
+    if (response.held) holdWorkerValue(stand, response.held, true);
+    stream.items = stand;
+  }
+  return {
+    data: response.unchanged ? null : stream.items as never[],
+    count: response.items,
+    unchanged: !!response.unchanged,
+  };
+}
+
+async function joinCatalogStream(
+  kind: 'vod' | 'series',
+  url: string,
+  accountId: string,
+  categoryIds: string[],
+  signal: AbortSignal | undefined,
+  options: SyncCatalogOptions,
+  detached: boolean,
+): Promise<{ response: XtreamCatalogStreamResponse; stream: SharedCatalogStream }> {
+  const cancelled = (): XtreamRequestError =>
+    new XtreamRequestError('cancelled', 'Xtream request was cancelled');
+  if (signal?.aborted) throw cancelled();
+  const timeout = CONFIG.XTREAM.WHOLE_CATALOG_TIMEOUT_MS;
+  const maxBytes = CONFIG.XTREAM.WHOLE_CATALOG_MAX_BYTES;
+  const keepUnknownCategories = !!options.keepUnknownCategories;
+  const previous = options.previous;
+  const key = JSON.stringify([kind, url, accountId, categoryIds, keepUnknownCategories, detached, previous ?? null]);
+  let stream = sharedCatalogStreams.get(key);
+  if (!stream) {
+    const token = `catalog-${String(nextCatalogStreamToken++)}`;
+    const batches: unknown[][] = [];
+    let releaseTurn!: () => void;
+    const turn = new Promise<void>((resolve) => { releaseTurn = resolve; });
+    const waitFor = catalogStreamTail;
+    catalogStreamTail = turn;
+    void turn.then(() => {
+      if (catalogStreamTail === turn) catalogStreamTail = null;
+    });
+    const run = () => runAppWorkerTask('xtream.catalog-stream', {
+      url, kind, accountId, categoryIds, keepUnknownCategories, token,
+      headersTimeout: CONFIG.XTREAM.WHOLE_CATALOG_HEADERS_TIMEOUT_MS,
+      idleTimeout: CATALOG_TIMEOUT, timeout, maxBytes,
+      ...(detached ? { detached } : {}),
+      ...(previous ? { previous } : {}),
+    }, chunk => {
+      batches.push(chunk.items);
+    });
+    let started!: SharedCatalogStream;
+    const task = waitFor
+      ? waitFor.then(() => {
+        if (started.abandoned) throw cancelled();
+        return run();
+      })
+      : run();
+    task.then(releaseTurn, releaseTurn);
+    started = { token, task, batches, waiters: 0, settled: false, releaseTurn };
+    const settle = (): void => {
+      started.settled = true;
+      if (sharedCatalogStreams.get(key) === started) sharedCatalogStreams.delete(key);
+    };
+    task.then(settle, settle);
+    sharedCatalogStreams.set(key, started);
+    stream = started;
+  }
+  const joined = stream;
+  joined.waiters++;
+  let left = false;
+  const leave = (): void => {
+    if (left) return;
+    left = true;
+    joined.waiters--;
+    if (joined.waiters > 0 || joined.settled) return;
+    if (sharedCatalogStreams.get(key) === joined) sharedCatalogStreams.delete(key);
+    joined.abandoned = true;
+    // The cancel stops the download, so the next catalog need not wait for it.
+    joined.releaseTurn();
+    runAppWorkerTask('xtream.catalog-stream.cancel', { token: joined.token }).catch(() => undefined);
+    // A load that finished before the cancel landed holds a list nobody will cache.
+    joined.task.then((late) => {
+      if (late.held) runAppWorkerTask('cache.release-held', { token: late.held.token }).catch(() => undefined);
+    }, () => undefined);
+  };
+  let onAbort = (): void => undefined;
+  const aborted = new Promise<never>((_, reject) => {
+    onAbort = () => {
+      leave();
+      reject(cancelled());
+    };
+    signal?.addEventListener('abort', onAbort);
+  });
+  let response;
+  try {
+    response = await Promise.race([joined.task, aborted]);
+  } catch (err) {
+    if (err instanceof XtreamRequestError) throw err;
+    throw new XtreamRequestError('request_failed', 'Catalog worker failed');
+  } finally {
+    signal?.removeEventListener('abort', onAbort);
+    leave();
+  }
+  if (response.failure) {
+    const error = new XtreamRequestError(response.failure, 'Xtream catalog stream failed');
+    logRequestFailure(url, error, timeout, maxBytes);
+    throw error;
+  }
+  return { response, stream: joined };
+}
+
+export function vodItemFrom(s: Record<string, unknown>, accountId: string): VodItem {
+  return {
     accountId,
-    streamId,
+    streamId: toStr(s.stream_id),
     name: toStr(s.name),
     poster: toStr(s.stream_icon),
     rating: toStr(s.rating),
     categoryId: toStr(s.category_id),
     containerExtension: toStr(s.container_extension),
     ...catalogSortMetadata(s),
-  } : null;
+  };
 }
 
-function seriesItem(accountId: string, s: Record<string, unknown>): SeriesItem | null {
-  const seriesId = toStr(s.series_id);
-  return seriesId ? {
+export function seriesItemFrom(s: Record<string, unknown>, accountId: string): SeriesItem {
+  return {
     accountId,
-    seriesId,
+    seriesId: toStr(s.series_id),
     name: toStr(s.name),
     poster: toStr(s.cover),
     rating: toStr(s.rating),
     categoryId: toStr(s.category_id),
     ...catalogSortMetadata(s, true),
-  } : null;
-}
-
-// Whole catalogs go straight into columns as each title is parsed.
-async function fetchCatalogColumns(
-  url: string,
-  kind: 'vod' | 'series',
-  accountId: string,
-  signal?: AbortSignal,
-): Promise<CatalogColumns> {
-  const builder = new CatalogColumnsBuilder(kind, accountId);
-  await streamCatalogList(
-    url,
-    CONFIG.XTREAM.WHOLE_CATALOG_MAX_BYTES,
-    CONFIG.XTREAM.WHOLE_CATALOG_TIMEOUT_MS,
-    kind === 'vod' ? 'stream_id' : 'series_id',
-    (raw) => {
-      if (kind === 'vod') {
-        const item = vodItem(accountId, raw);
-        if (item) builder.add({ ...item, id: item.streamId });
-      } else {
-        const item = seriesItem(accountId, raw);
-        if (item) builder.add({ ...item, id: item.seriesId });
-      }
-    },
-    signal,
-  );
-  return builder.build();
+  };
 }
 
 // Coerce an unknown JSON value to an array of plain objects (empty if not an array).
@@ -432,11 +638,39 @@ export function createXtreamClient(creds: XtreamCredentials, accountId = '') {
     },
 
     async getLiveStreamsResult(signal?: AbortSignal): Promise<XtreamLiveCatalogResult> {
+      const url = xtreamPlayerApi(creds, 'get_live_streams');
+      const maxBytes = CONFIG.XTREAM.CATALOG_MAX_BYTES;
+      // A 50k-stream catalog parses for seconds on a TV; keep it off the UI
+      // thread. The worker can't take an AbortSignal, so cancellable calls stay.
+      if (!signal && typeof Worker !== 'undefined') {
+        let result: XtreamLiveStreamsResponse | null = null;
+        try {
+          result = await runAppWorkerTask('xtream.live-streams', {
+            url,
+            timeout: CATALOG_TIMEOUT,
+            maxBytes,
+          });
+        } catch (err) {
+          // The worker itself broke, not the request: retry on this thread.
+          log.warn('Xtream live catalog worker failed', 'event=xtream.live_catalog.worker_failed', err);
+        }
+        if (result) {
+          if (result.failure) {
+            logRequestFailure(
+              url,
+              new XtreamRequestError(result.failure, 'Xtream request failed'),
+              CATALOG_TIMEOUT,
+              maxBytes,
+            );
+          }
+          return { available: result.available, streams: result.streams };
+        }
+      }
       try {
         const value = await fetchJsonStrict(
-          xtreamPlayerApi(creds, 'get_live_streams'),
+          url,
           CATALOG_TIMEOUT,
-          CONFIG.XTREAM.CATALOG_MAX_BYTES,
+          maxBytes,
           signal,
         );
         return {
@@ -465,21 +699,8 @@ export function createXtreamClient(creds: XtreamCredentials, accountId = '') {
         .filter(category => category.id !== '');
     },
 
-    async getServerClock(signal?: AbortSignal): Promise<XtreamServerClock | null> {
-      const data = await fetchJson(
-        xtreamPlayerApi(creds),
-        ACCOUNT_INFO_TIMEOUT,
-        CONFIG.XTREAM.ACCOUNT_MAX_BYTES,
-        signal,
-      );
-      if (!data || typeof data !== 'object') return null;
-      const server = (data as { server_info?: unknown }).server_info;
-      if (!server || typeof server !== 'object') return null;
-      const record = server as Record<string, unknown>;
-      return {
-        timeZone: toStr(record.timezone),
-        offsetMinutes: parseServerOffset(record),
-      };
+    getServerClock(signal?: AbortSignal): Promise<XtreamServerClock | null> {
+      return loadServerClock(creds, signal);
     },
 
     async getArchiveListings(
@@ -521,34 +742,50 @@ export function createXtreamClient(creds: XtreamCredentials, accountId = '') {
     },
 
     async getVodCategories(signal?: AbortSignal): Promise<VodCategory[]> {
-      return fetchCatalogList(
+      const arr = await fetchCatalogArray(
         xtreamPlayerApi(creds, 'get_vod_categories'),
         CONFIG.XTREAM.CATEGORY_MAX_BYTES,
-        CATALOG_TIMEOUT,
         'category_id',
-        (c) => {
-          const id = toStr(c.category_id);
-          return id ? { id, name: toStr(c.category_name) } : null;
-        },
         signal,
       );
+      return arr
+        .map((c) => ({ id: toStr(c.category_id), name: toStr(c.category_name) }))
+        .filter((c) => c.id !== '');
     },
 
     async getVodStreams(categoryId?: string, signal?: AbortSignal): Promise<VodItem[]> {
       const params = categoryId ? { category_id: categoryId } : undefined;
-      return fetchCatalogList(
+      const arr = await fetchCatalogArray(
         xtreamPlayerApi(creds, 'get_vod_streams', params),
-        categoryId ? CONFIG.XTREAM.CATALOG_MAX_BYTES : CONFIG.XTREAM.WHOLE_CATALOG_MAX_BYTES,
-        categoryId ? CATALOG_TIMEOUT : CONFIG.XTREAM.WHOLE_CATALOG_TIMEOUT_MS,
+        CONFIG.XTREAM.CATALOG_MAX_BYTES,
         'stream_id',
-        s => vodItem(accountId, s),
         signal,
+      );
+      return arr
+        .map(s => vodItemFrom(s, accountId))
+        .filter((v) => v.streamId !== '');
+    },
+
+    /** The whole movie catalog in one streamed request, parsed in the worker. */
+    getAllVodStreams(
+      categoryIds: string[],
+      signal?: AbortSignal,
+      options?: WholeCatalogOptions,
+    ): Promise<VodItem[]> {
+      return streamCatalogInWorker<VodItem>(
+        'vod', xtreamPlayerApi(creds, 'get_vod_streams'), accountId, categoryIds, signal, options,
       );
     },
 
-    /** Every movie on the account, from one unfiltered request. */
-    getVodCatalog(signal?: AbortSignal): Promise<CatalogColumns> {
-      return fetchCatalogColumns(xtreamPlayerApi(creds, 'get_vod_streams'), 'vod', accountId, signal);
+    /** getAllVodStreams for the cache only: the list stays in the worker. */
+    syncAllVodStreams(
+      categoryIds: string[],
+      signal?: AbortSignal,
+      options?: SyncCatalogOptions,
+    ): Promise<SyncedCatalog> {
+      return syncCatalogInWorker(
+        'vod', xtreamPlayerApi(creds, 'get_vod_streams'), accountId, categoryIds, signal, options,
+      );
     },
 
     async getVodInfo(vodId: string, signal?: AbortSignal): Promise<VodInfo | null> {
@@ -578,34 +815,50 @@ export function createXtreamClient(creds: XtreamCredentials, accountId = '') {
     },
 
     async getSeriesCategories(signal?: AbortSignal): Promise<SeriesCategory[]> {
-      return fetchCatalogList(
+      const arr = await fetchCatalogArray(
         xtreamPlayerApi(creds, 'get_series_categories'),
         CONFIG.XTREAM.CATEGORY_MAX_BYTES,
-        CATALOG_TIMEOUT,
         'category_id',
-        (c) => {
-          const id = toStr(c.category_id);
-          return id ? { id, name: toStr(c.category_name) } : null;
-        },
         signal,
       );
+      return arr
+        .map((c) => ({ id: toStr(c.category_id), name: toStr(c.category_name) }))
+        .filter((c) => c.id !== '');
     },
 
     async getSeries(categoryId?: string, signal?: AbortSignal): Promise<SeriesItem[]> {
       const params = categoryId ? { category_id: categoryId } : undefined;
-      return fetchCatalogList(
+      const arr = await fetchCatalogArray(
         xtreamPlayerApi(creds, 'get_series', params),
-        categoryId ? CONFIG.XTREAM.CATALOG_MAX_BYTES : CONFIG.XTREAM.WHOLE_CATALOG_MAX_BYTES,
-        categoryId ? CATALOG_TIMEOUT : CONFIG.XTREAM.WHOLE_CATALOG_TIMEOUT_MS,
+        CONFIG.XTREAM.CATALOG_MAX_BYTES,
         'series_id',
-        s => seriesItem(accountId, s),
         signal,
+      );
+      return arr
+        .map(s => seriesItemFrom(s, accountId))
+        .filter((s) => s.seriesId !== '');
+    },
+
+    /** The whole series catalog in one streamed request, parsed in the worker. */
+    getAllSeries(
+      categoryIds: string[],
+      signal?: AbortSignal,
+      options?: WholeCatalogOptions,
+    ): Promise<SeriesItem[]> {
+      return streamCatalogInWorker<SeriesItem>(
+        'series', xtreamPlayerApi(creds, 'get_series'), accountId, categoryIds, signal, options,
       );
     },
 
-    /** Every series on the account, from one unfiltered request. */
-    getSeriesCatalog(signal?: AbortSignal): Promise<CatalogColumns> {
-      return fetchCatalogColumns(xtreamPlayerApi(creds, 'get_series'), 'series', accountId, signal);
+    /** getAllSeries for the cache only: the list stays in the worker. */
+    syncAllSeries(
+      categoryIds: string[],
+      signal?: AbortSignal,
+      options?: SyncCatalogOptions,
+    ): Promise<SyncedCatalog> {
+      return syncCatalogInWorker(
+        'series', xtreamPlayerApi(creds, 'get_series'), accountId, categoryIds, signal, options,
+      );
     },
 
     async getSeriesInfo(seriesId: string, signal?: AbortSignal): Promise<SeriesInfo | null> {

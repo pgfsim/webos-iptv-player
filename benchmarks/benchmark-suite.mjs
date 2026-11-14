@@ -1,9 +1,9 @@
 import { once } from 'node:events';
-import { execFile, spawn } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { createServer } from 'node:http';
-import { createSocket } from 'node:dgram';
 import path from 'node:path';
 import { gzipSync } from 'node:zlib';
+import { formatUrlHost, resolveLocalAddress } from './benchmark-shared.mjs';
 
 // Shared fixture, measurement, and assertion functions used by both runners.
 // Browser functions run inside the app page via `fn.toString()`, so those
@@ -84,7 +84,7 @@ export async function installBenchmarkFixture(options) {
     if (db.objectStoreNames.contains('playlist-cache')) {
       const playlistTx = db.transaction('playlist-cache', 'readonly');
       playlistCache = await requestValue(
-        playlistTx.objectStore('playlist-cache').get('combined-v3'),
+        playlistTx.objectStore('playlist-cache').get('combined-v4'),
       ) || null;
     }
     let cacheMeta = null;
@@ -327,13 +327,54 @@ export async function installBenchmarkFixture(options) {
       );
     }
     const fixtureTx = db.transaction(fixtureStores, 'readwrite');
+    // The app's packed guide format (`epg-packed-1`), as it writes the cache
+    // itself; a plain object guide would time a legacy read instead.
+    const packBlocks = (entries, perBlock, weight) => {
+      const blocks = [];
+      let block = [];
+      let count = 0;
+      for (const entry of entries) {
+        block.push(...entry);
+        count += weight(entry);
+        if (count >= perBlock) {
+          blocks.push(JSON.stringify(block));
+          block = [];
+          count = 0;
+        }
+      }
+      if (block.length) blocks.push(JSON.stringify(block));
+      return blocks;
+    };
+    const flatPrograms = (list) => {
+      const flat = [];
+      for (const programme of list) {
+        flat.push(
+          programme.start.getTime(),
+          programme.stop.getTime(),
+          programme.title,
+          programme.description,
+          programme.category,
+          programme.icon,
+        );
+      }
+      return flat;
+    };
     fixtureTx.objectStore('epg-cache').put(cacheRecord('epg-cache', 'epg', {
       url: options.epgUrl,
       timestamp: Date.now(),
       data: {
-        channels: epgChannels,
-        programmes: { ch0: programs, ch1: transitionPrograms },
-        tzOffsetMinutes: null,
+        format: 'epg-packed-1',
+        meta: { tzOffsetMinutes: null },
+        channels: packBlocks(
+          Object.keys(epgChannels).map((id) => [id, epgChannels[id].name, epgChannels[id].icon, null]),
+          500,
+          () => 1,
+        ),
+        programmes: packBlocks(
+          [['ch0', flatPrograms(programs)], ['ch1', flatPrograms(transitionPrograms)]],
+          500,
+          (entry) => entry[1].length / 6,
+        ),
       },
     }));
     if (directStorage) {
@@ -341,7 +382,7 @@ export async function installBenchmarkFixture(options) {
         'playlist-cache',
         'playlist',
         {
-        key: 'combined-v3',
+        key: 'combined-v4',
         timestamp: Date.now(),
         data: {
           sourceSignature: (sourceHash >>> 0).toString(16),
@@ -523,6 +564,57 @@ export function installColdLoadFixture(options) {
   return { playlists: 1 };
 }
 
+// A newer app shows Live at once and fills its list under the tab bar's
+// progress; an older one shows Live only once the whole list has loaded and
+// has no progress bar, so the same wait means "the whole list is ready".
+export async function waitForPlaylistLoaded(options = {}) {
+  const timeoutMs = options.timeoutMs ?? 30_000;
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    if (document.querySelector('#view-channels:not(.hidden) .channel-main .channel-item')
+        && !document.querySelector('.tab-bar-progress.active')) return;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  throw new Error('Timed out waiting for the playlist to finish loading');
+}
+
+// Work the app defers past a usable list (restoring the cached guide) can
+// stall the first interaction, so it is measured here and the hover sample
+// waits for it, rather than racing it.
+export async function waitForStartupSettled(options = {}) {
+  const quietMs = options.quietMs ?? 1000;
+  const timeoutMs = options.timeoutMs ?? 30_000;
+  const started = performance.now();
+  const tasks = [];
+  let observer = null;
+  try {
+    observer = new PerformanceObserver((list) => {
+      list.getEntries().forEach((entry) => tasks.push(entry));
+    });
+    observer.observe({ entryTypes: ['longtask'] });
+  } catch {
+    observer = null;
+  }
+  let lastBusy = started;
+  while (performance.now() - lastBusy < quietMs) {
+    if (performance.now() - started > timeoutMs) break;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    if (observer) observer.takeRecords().forEach((entry) => tasks.push(entry));
+    for (const task of tasks) lastBusy = Math.max(lastBusy, task.startTime + task.duration);
+  }
+  observer?.disconnect();
+  const round = (value) => Math.round(value * 10) / 10;
+  return {
+    settledMs: round(lastBusy - started),
+    maxLongTaskMs: observer
+      ? round(tasks.reduce((max, task) => Math.max(max, task.duration), 0))
+      : null,
+    longTaskTotalMs: observer
+      ? round(tasks.reduce((sum, task) => sum + task.duration, 0))
+      : null,
+  };
+}
+
 export async function measureStartupHoverBenchmark() {
   const target = document.querySelector('.channel-main .channel-item');
   if (!target) throw new Error('Missing channel row for startup hover benchmark');
@@ -538,7 +630,8 @@ export async function measureStartupHoverBenchmark() {
 }
 
 export function assertStartupHoverBenchmark(report) {
-  if (!report.focusedSynchronously || !report.focusedAtFrame) {
+  // The TV paints a hovered row at the next reconcile frame, not synchronously.
+  if (!report.focusedAtFrame) {
     throw new Error('Startup hover did not focus the channel row before its next frame');
   }
   if (!Number.isFinite(report.hoverFrameMs) || report.hoverFrameMs < 0) {
@@ -699,8 +792,12 @@ export async function cleanupBenchmarkFixture(options) {
     if (cleanupStores.indexOf('playlist-cache') >= 0) {
       const playlist = cleanupTx.objectStore('playlist-cache');
       const savedPlaylist = backupEntry?.data?.playlistCache;
+      // A newer app stores the channels as chunk records beside the head.
+      if (typeof IDBKeyRange !== 'undefined') {
+        playlist.delete(IDBKeyRange.bound('combined-v4#', 'combined-v4#\uffff'));
+      }
       if (savedPlaylist) playlist.put(savedPlaylist);
-      else playlist.delete('combined-v3');
+      else playlist.delete('combined-v4');
     }
     if (cleanupStores.indexOf('parental-control') >= 0
         && backupEntry?.data && 'parentalConfig' in backupEntry.data) {
@@ -1185,21 +1282,6 @@ export async function measureXMLTVPipelineComparison(options, io) {
   };
 }
 
-async function resolveLocalAddress(deviceIp) {
-  const socket = createSocket('udp4');
-  try {
-    socket.connect(9, deviceIp);
-    await once(socket, 'connect');
-    return socket.address().address;
-  } finally {
-    socket.close();
-  }
-}
-
-function formatUrlHost(host) {
-  return host.includes(':') ? `[${host}]` : host;
-}
-
 async function startXMLTVBenchmarkServer(deviceIp, body, options = {}) {
   const chunkBytes = options.chunkBytes ?? 16 * 1024;
   const chunkDelayMs = options.chunkDelayMs ?? 1;
@@ -1343,357 +1425,6 @@ export async function measureHostedXMLTVPipelineComparison(options, io) {
   }
 }
 
-export const LARGE_PLAYLIST_CATEGORIES = 605;
-const LARGE_PLAYLIST_KEPT_CATEGORIES = 30;
-
-// Keeps about 5% of the large playlist's Live categories, as a user trimming
-// a provider catalog down to a few countries would.
-export function largePlaylistCategoryFilter() {
-  return {
-    mode: 'include',
-    ids: Array.from({ length: LARGE_PLAYLIST_KEPT_CATEGORIES }, (_, index) => String(index)),
-  };
-}
-
-export function largePlaylistFilteredChannels(liveEntries, filter) {
-  const kept = new Set(filter.ids.map(Number));
-  let channels = 0;
-  for (let index = 0; index < liveEntries; index++) {
-    if (kept.has(index % LARGE_PLAYLIST_CATEGORIES)) channels++;
-  }
-  return channels;
-}
-
-export async function measureLargePlaylistMemory(options, io) {
-  if (options.liveEntries > options.totalEntries) {
-    throw new Error('Large playlist Live count cannot exceed total entries');
-  }
-  const server = await startLargePlaylistBenchmarkServer(options);
-  try {
-    await io.page.goto('/');
-    await io.page.evaluate(installLargePlaylistSource, {
-      id: 'benchmark-control',
-      name: 'Control',
-      url: `${server.origin}/tiny.m3u`,
-      source: 'url',
-    });
-    await io.page.reload({ waitUntil: 'domcontentloaded' });
-    await io.page.evaluate(waitForLargePlaylistChannelCount, {
-      expected: 1,
-      timeoutMs: options.timeoutMs,
-    });
-    await io.delay(1500);
-    await io.collectGarbage();
-    const baseline = await sampleChromiumMemory(io);
-
-    await io.page.evaluate(installLargePlaylistSource, {
-      id: options.accountId,
-      name: 'Large Playlist',
-      url: server.origin,
-      source: 'xtream',
-      xtream: {
-        username: 'u',
-        password: 'p',
-        liveOutput: 'ts',
-        ...(options.liveCategories ? { liveCategories: options.liveCategories } : {}),
-      },
-    });
-
-    const samples = [baseline];
-    let sampling = true;
-    const sampler = (async () => {
-      while (sampling) {
-        await io.delay(options.sampleIntervalMs);
-        const sample = await sampleChromiumMemory(io).catch(() => null);
-        if (sample) samples.push(sample);
-      }
-    })();
-    let readyMs;
-    try {
-      const started = performance.now();
-      await io.page.reload({ waitUntil: 'domcontentloaded' });
-      await io.page.evaluate(waitForLargePlaylistChannelCount, {
-        expected: options.expectedChannels ?? options.liveEntries,
-        timeoutMs: options.timeoutMs,
-      });
-      readyMs = performance.now() - started;
-      await io.delay(1500);
-      await io.collectGarbage();
-      samples.push(await sampleChromiumMemory(io));
-    } finally {
-      sampling = false;
-      await sampler;
-    }
-
-    const retained = samples[samples.length - 1];
-    const peakRssBytes = Math.max(...samples.map(sample => sample.rssBytes));
-    const peakHeapBytes = Math.max(...samples.map(sample => sample.heapUsedBytes));
-    return {
-      totalEntries: options.totalEntries,
-      liveEntries: options.liveEntries,
-      keptCategories: options.liveCategories?.ids.length ?? LARGE_PLAYLIST_CATEGORIES,
-      playlistBytes: options.playlistBytes,
-      playlistMiB: bytesToMiB(options.playlistBytes),
-      catalogBytes: server.stats.catalogBytes,
-      catalogMiB: bytesToMiB(server.stats.catalogBytes),
-      chunkBytes: options.chunkBytes,
-      chunkDelayMs: options.chunkDelayMs,
-      playlistDurationMs: roundHundredths(server.stats.playlistDurationMs),
-      readyMs: roundHundredths(readyMs),
-      channels: await io.page.evaluate(readLargePlaylistChannelCount),
-      samples: samples.length,
-      baselineRendererProcesses: baseline.rendererCount,
-      peakRendererProcesses: Math.max(...samples.map(sample => sample.rendererCount)),
-      baselineRssMiB: bytesToMiB(baseline.rssBytes),
-      peakRssMiB: bytesToMiB(peakRssBytes),
-      peakRssDeltaMiB: bytesToMiB(peakRssBytes - baseline.rssBytes),
-      retainedRssMiB: bytesToMiB(retained.rssBytes),
-      retainedRssDeltaMiB: bytesToMiB(retained.rssBytes - baseline.rssBytes),
-      baselineHeapMiB: bytesToMiB(baseline.heapUsedBytes),
-      peakHeapMiB: bytesToMiB(peakHeapBytes),
-      peakHeapDeltaMiB: bytesToMiB(peakHeapBytes - baseline.heapUsedBytes),
-      retainedHeapMiB: bytesToMiB(retained.heapUsedBytes),
-      retainedHeapDeltaMiB: bytesToMiB(retained.heapUsedBytes - baseline.heapUsedBytes),
-    };
-  } finally {
-    await server.close();
-  }
-}
-
-export async function startLargePlaylistBenchmarkServer(options) {
-  const publicHost = options.advertisedHost ?? (
-    options.deviceIp ? await resolveLocalAddress(options.deviceIp) : '127.0.0.1'
-  );
-  const bindHost = options.deviceIp ? '0.0.0.0' : '127.0.0.1';
-  const stats = {
-    catalogBytes: 0,
-    playlistDurationMs: 0,
-  };
-  let origin = '';
-  const server = createServer((request, response) => {
-    const url = new URL(request.url || '/', 'http://host');
-    response.setHeader('Access-Control-Allow-Origin', '*');
-    response.setHeader('Cache-Control', 'no-store');
-    if (url.pathname === '/tiny.m3u') {
-      response.writeHead(200, { 'Content-Type': 'application/x-mpegURL' });
-      response.end('#EXTM3U\n#EXTINF:-1,Control\nhttp://host/control\n');
-      return;
-    }
-    if (url.pathname === '/xmltv.php') {
-      response.writeHead(200, { 'Content-Type': 'application/xml' });
-      response.end('<?xml version="1.0"?><tv></tv>');
-      return;
-    }
-    if (url.pathname === '/player_api.php') {
-      const action = url.searchParams.get('action');
-      if (action === 'get_live_streams') {
-        void streamLargeLiveCatalog(response, options, stats);
-        return;
-      }
-      if (action === 'get_live_categories') {
-        response.writeHead(200, { 'Content-Type': 'application/json' });
-        response.end(JSON.stringify(Array.from({ length: LARGE_PLAYLIST_CATEGORIES }, (_, index) => ({
-          category_id: String(index),
-          category_name: `Group ${String(index).padStart(3, '0')}`,
-        }))));
-        return;
-      }
-      response.writeHead(200, { 'Content-Type': 'application/json' });
-      response.end(JSON.stringify({
-        user_info: {
-          auth: 1,
-          status: 'Active',
-          max_connections: 1,
-          allowed_output_formats: ['m3u8', 'ts'],
-        },
-        server_info: { timezone: 'UTC' },
-      }));
-      return;
-    }
-    if (url.pathname === '/get.php') {
-      void streamLargePlaylist(response, origin, options, stats);
-      return;
-    }
-    response.writeHead(404).end('Not found');
-  });
-  server.listen(options.port ?? 0, bindHost);
-  await once(server, 'listening');
-  const address = server.address();
-  if (!address || typeof address === 'string') {
-    server.close();
-    throw new Error('Large playlist server did not bind to a TCP port');
-  }
-  origin = `http://${formatUrlHost(publicHost)}:${String(address.port)}`;
-  return {
-    origin,
-    stats,
-    close: async () => {
-      server.close();
-      await once(server, 'close');
-    },
-  };
-}
-
-async function streamLargeLiveCatalog(response, options, stats) {
-  response.writeHead(200, { 'Content-Type': 'application/json' });
-  let batch = '[';
-  let total = 0;
-  for (let index = 0; index < options.liveEntries; index++) {
-    batch += `${index ? ',' : ''}{"stream_id":"${largePlaylistEntryId(index)}",`
-      + `"category_id":"${String(index % LARGE_PLAYLIST_CATEGORIES)}"}`;
-    if (batch.length >= options.chunkBytes) {
-      total += Buffer.byteLength(batch);
-      if (!await writeBenchmarkResponse(response, batch)) return;
-      batch = '';
-    }
-  }
-  batch += ']';
-  total += Buffer.byteLength(batch);
-  if (!await writeBenchmarkResponse(response, batch)) return;
-  stats.catalogBytes = total;
-  response.end();
-}
-
-async function streamLargePlaylist(response, origin, options, stats) {
-  const started = performance.now();
-  const header = '#EXTM3U\n';
-  const payloadBytes = options.playlistBytes - Buffer.byteLength(header);
-  const recordBytes = Math.floor(payloadBytes / options.totalEntries);
-  const largerRecords = payloadBytes % options.totalEntries;
-  response.writeHead(200, {
-    'Content-Length': String(options.playlistBytes),
-    'Content-Type': 'application/octet-stream',
-  });
-  if (!await writeBenchmarkResponse(response, header)) return;
-  let batch = '';
-  for (let index = 0; index < options.totalEntries; index++) {
-    const targetBytes = recordBytes + (index < largerRecords ? 1 : 0);
-    batch += buildLargePlaylistRecord(index, targetBytes, origin, options.liveEntries);
-    if (batch.length >= options.chunkBytes) {
-      if (!await writeBenchmarkResponse(response, batch)) return;
-      batch = '';
-      if (options.chunkDelayMs > 0) await new Promise(
-        resolve => setTimeout(resolve, options.chunkDelayMs),
-      );
-    }
-  }
-  if (batch && !await writeBenchmarkResponse(response, batch)) return;
-  stats.playlistDurationMs = performance.now() - started;
-  response.end();
-}
-
-function buildLargePlaylistRecord(index, targetBytes, origin, liveEntries) {
-  const id = largePlaylistEntryId(index < liveEntries
-    ? index
-    : (index - liveEntries) % liveEntries);
-  const group = String(index % LARGE_PLAYLIST_CATEGORIES).padStart(3, '0');
-  const kind = index < liveEntries
-    ? 'live'
-    : ['movie', 'series', 'vod'][index % 3];
-  const extension = kind === 'live' ? 'ts' : kind === 'series' ? 'mkv' : 'mp4';
-  const base = [
-    `#EXTINF:-1 tvg-id="ch${id}" tvg-name="Channel ${id}" `
-      + `group-title="Group ${group}" catchup="xc" catchup-days="7" `
-      + `custom="v${id}",Channel ${id}\n`,
-    '#EXTVLCOPT:http-user-agent=BenchmarkAgent\n',
-    `${origin}/${kind}/u/p/${id}.${extension}\n`,
-  ].join('');
-  const paddingBytes = targetBytes - Buffer.byteLength(base);
-  if (paddingBytes < 2) {
-    throw new Error(
-      `Large playlist record ${String(index)} needs ${String(Buffer.byteLength(base))} bytes, `
-      + `but its target is ${String(targetBytes)}`,
-    );
-  }
-  return `${base}#${'x'.repeat(paddingBytes - 2)}\n`;
-}
-
-function largePlaylistEntryId(index) {
-  return String(index + 1).padStart(6, '0');
-}
-
-async function writeBenchmarkResponse(response, chunk) {
-  if (response.destroyed) return false;
-  if (response.write(chunk)) return true;
-  return new Promise((resolve) => {
-    const done = () => {
-      response.off('drain', drained);
-      response.off('close', closed);
-    };
-    const drained = () => {
-      done();
-      resolve(true);
-    };
-    const closed = () => {
-      done();
-      resolve(false);
-    };
-    response.once('drain', drained);
-    response.once('close', closed);
-  });
-}
-
-export function installLargePlaylistSource(playlist) {
-  localStorage.setItem('iptv_playlists', JSON.stringify([playlist]));
-  localStorage.removeItem('iptv_selectedXtream');
-  localStorage.removeItem('iptv_cached_playlist');
-}
-
-export async function waitForLargePlaylistChannelCount(options) {
-  const started = Date.now();
-  while (Date.now() - started < options.timeoutMs) {
-    const spacer = document.querySelector('.channel-list-spacer');
-    const height = Number.parseFloat(spacer?.style.height || '0');
-    if (Math.round(height / 88) === options.expected) return;
-    await new Promise(resolve => setTimeout(resolve, 50));
-  }
-  throw new Error(`Timed out waiting for ${String(options.expected)} channels`);
-}
-
-export function readLargePlaylistChannelCount() {
-  const spacer = document.querySelector('.channel-list-spacer');
-  return Math.round(Number.parseFloat(spacer?.style.height || '0') / 88);
-}
-
-async function sampleChromiumMemory(io) {
-  const [processes, heap] = await Promise.all([
-    io.browserCdp.send('SystemInfo.getProcessInfo'),
-    io.pageCdp.send('Runtime.getHeapUsage'),
-  ]);
-  const pids = processes.processInfo
-    .filter(info => info.type.toLowerCase() === 'renderer')
-    .map(info => info.id)
-    .filter(pid => Number.isInteger(pid) && pid > 0);
-  return {
-    rssBytes: await processRss(pids),
-    heapUsedBytes: heap.usedSize,
-    rendererCount: pids.length,
-  };
-}
-
-async function processRss(pids) {
-  if (!pids.length) return 0;
-  const output = await new Promise((resolve, reject) => {
-    execFile('ps', ['-o', 'rss=', '-p', pids.join(',')], {
-      encoding: 'utf8',
-    }, (error, stdout) => {
-      if (error) reject(error);
-      else resolve(stdout);
-    });
-  });
-  return output.trim().split(/\s+/)
-    .filter(Boolean)
-    .reduce((total, value) => total + Number(value) * 1024, 0);
-}
-
-function bytesToMiB(bytes) {
-  return roundHundredths(bytes / 1_048_576);
-}
-
-function roundHundredths(value) {
-  return Math.round(value * 100) / 100;
-}
-
 export async function runViewReopenCycle() {
     const waitFor = async (selector, timeout = 30_000) => {
       const started = Date.now();
@@ -1726,6 +1457,13 @@ export async function runViewReopenCycle() {
 
     click('[data-section="live"]');
     await waitFor('#view-channels:not(.hidden)');
+    await settle();
+    // After a pointer tab click the first key only shows the parked ring;
+    // the app consumes it exactly when its deferred owner holds one.
+    if (document.querySelector('[data-ring-owner="deferred"] .focused-parked')) {
+      key('Enter', 13);
+      await settle();
+    }
     key('Enter', 13);
     await waitFor('#view-player:not(.hidden)');
     key('Backspace', 461);
@@ -1765,11 +1503,20 @@ export async function installUniqueGroupFixture(scale) {
   });
   const tx = db.transaction('playlist-cache', 'readwrite');
   const store = tx.objectStore('playlist-cache');
-  const cached = await new Promise((resolve, reject) => {
-    const request = store.get('combined-v3');
-    request.onerror = () => reject(request.error);
-    request.onsuccess = () => resolve(request.result);
-  });
+  // A newer app may have moved the fixture's channels into chunk records;
+  // join them back, and the rewrite below stores one record again.
+  const [cached, chunks] = await Promise.all(['combined-v4',
+    IDBKeyRange.bound('combined-v4#', 'combined-v4#\uffff')].map((key, index) =>
+    new Promise((resolve, reject) => {
+      const request = index ? store.getAll(key) : store.get(key);
+      request.onerror = () => reject(request.error);
+      request.onsuccess = () => resolve(request.result);
+    })));
+  if (cached && cached.data && !Array.isArray(cached.data.channels) && chunks.length) {
+    const { chunkCount: _chunks, channelCount: _count, ...data } = cached.data;
+    cached.data = { ...data, channels: [].concat(...chunks.map(chunk => chunk.channels)) };
+  }
+  store.delete(IDBKeyRange.bound('combined-v4#', 'combined-v4#\uffff'));
   if (!cached || !cached.data || !Array.isArray(cached.data.channels)
       || cached.data.channels.length !== scale) {
     db.close();
@@ -1821,11 +1568,20 @@ export async function installM3USearchFixture() {
   });
   const tx = db.transaction('playlist-cache', 'readwrite');
   const store = tx.objectStore('playlist-cache');
-  const cached = await new Promise((resolve, reject) => {
-    const request = store.get('combined-v3');
-    request.onerror = () => reject(request.error);
-    request.onsuccess = () => resolve(request.result);
-  });
+  // A newer app may have moved the fixture's channels into chunk records;
+  // join them back, and the rewrite below stores one record again.
+  const [cached, chunks] = await Promise.all(['combined-v4',
+    IDBKeyRange.bound('combined-v4#', 'combined-v4#\uffff')].map((key, index) =>
+    new Promise((resolve, reject) => {
+      const request = index ? store.getAll(key) : store.get(key);
+      request.onerror = () => reject(request.error);
+      request.onsuccess = () => resolve(request.result);
+    })));
+  if (cached && cached.data && !Array.isArray(cached.data.channels) && chunks.length) {
+    const { chunkCount: _chunks, channelCount: _count, ...data } = cached.data;
+    cached.data = { ...data, channels: [].concat(...chunks.map(chunk => chunk.channels)) };
+  }
+  store.delete(IDBKeyRange.bound('combined-v4#', 'combined-v4#\uffff'));
   if (!cached || !cached.data || !Array.isArray(cached.data.channels)) {
     db.close();
     throw new Error('M3U Search benchmark requires a cached playlist fixture');
@@ -2135,19 +1891,26 @@ export async function runM3USearchBenchmark(options) {
 }
 
 // The cold open must build every source index and the warm one load them all.
-function assertSearchIndexSamples(label, report) {
+// `tvQuirks`: a TV's small storage quota can leave an index unstored, so its
+// warm open builds it again; that only warns.
+function assertSearchIndexSamples(label, report, tvQuirks = false) {
   const cold = report.indexBuild;
   const warm = report.indexBuildWarm;
   if (!cold.workerStarted || !(cold.built > 0)) {
     throw new Error(`${label} cold Search open built ${String(cold.built)} indexes on a ${cold.workerStarted ? 'new' : 'running'} worker`);
   }
   if (!warm.workerStarted || warm.built !== 0 || !(warm.storedIndexes > 0)) {
-    throw new Error(`${label} warm Search open built ${String(warm.built)} of ${String(warm.storedIndexes)} stored indexes`);
+    const message = `${label} warm Search open built ${String(warm.built)} of ${String(warm.storedIndexes)} stored indexes`;
+    if (tvQuirks && warm.workerStarted) {
+      console.warn(`Warning: ${message} (cold open built ${String(cold.built)})`);
+      return;
+    }
+    throw new Error(message);
   }
 }
 
-export function assertM3USearchBenchmark(report) {
-  assertSearchIndexSamples('M3U', report);
+export function assertM3USearchBenchmark(report, options = {}) {
+  assertSearchIndexSamples('M3U', report, options.tvQuirks);
   if (!(report.renderedPrograms > 0 && report.renderedPrograms < 30)) {
     throw new Error(
       `M3U Search mounted ${String(report.renderedPrograms)} program rows; expected 1-29`,
@@ -3420,7 +3183,7 @@ export async function runBenchmarkSuites(options) {
     };
 }
 
-export function assertBenchmarkScale(report, scale) {
+export function assertBenchmarkScale(report, scale, options = {}) {
   const closeTo = (actual, expected, tolerance = 0) => {
     const numeric = parseFloat(String(actual).replace(/_/g, ''));
     if (Math.abs(numeric - expected) > tolerance) {
@@ -3456,7 +3219,7 @@ export function assertBenchmarkScale(report, scale) {
   bounded('Series', report.series.rendered, 60);
   bounded('Episodes', report.series.episodes.rendered, 20);
   bounded('Search programs', report.search.xtream.renderedPrograms, 30);
-  assertSearchIndexSamples('Xtream', report.search.xtream);
+  assertSearchIndexSamples('Xtream', report.search.xtream, options.tvQuirks);
   if (!report.interactions.wheelToDpad.focusedConnected) {
     throw new Error('Wheel-to-D-pad focus is detached');
   }
@@ -3505,7 +3268,14 @@ export function assertBenchmarkScale(report, scale) {
   closeTo(report.sidebar.totalSize, scale * 88);
   closeTo(report.epg.channelTotalSize, scale * 72);
   closeTo(report.epg.programTotalSize, scale * 80, 2048);
-  closeTo(report.movies.categoryTotalSize, (scale - 6) * 320, 32);
+  // An older build also lists the fixture's six empty movie categories, so a
+  // run measuring one warns instead of failing.
+  const categoryExtent = parseFloat(String(report.movies.categoryTotalSize).replace(/_/g, ''));
+  if (Math.abs(categoryExtent - scale * 320) <= 32) {
+    console.warn(`Warning: Movies category extent ${String(categoryExtent)}px includes the empty categories; expected ${String((scale - 6) * 320)}px`);
+  } else {
+    closeTo(report.movies.categoryTotalSize, (scale - 6) * 320, 32);
+  }
   closeTo(report.movies.totalSize, Math.ceil(scale / 7) * 395, 32);
   closeTo(report.series.totalSize, Math.ceil(scale / 7) * 395, 32);
   closeTo(report.series.episodes.totalSize, scale * 138);

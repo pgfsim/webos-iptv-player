@@ -125,9 +125,6 @@ export const ZH_CN_MESSAGES = {
   'catalog.seriesCount': {
     other: '共 {count} 部',
   },
-  'catalog.episodeCount': {
-    other: '共 {count} 集',
-  },
   'catalog.noMovies': '此账号没有可用的电影。',
   'catalog.noMoviesCategory': '此分类暂无电影。',
   'catalog.noSeries': '此账号没有可用的剧集。',
@@ -189,6 +186,8 @@ export const ZH_CN_MESSAGES = {
     other: '{count} 秒后开始播放',
   },
   'player.playNow': '立即播放',
+  'player.previousEpisode': '上一集',
+  'player.nextEpisode': '下一集',
   'player.unableToPlay': '无法播放此视频。',
   'player.reconnecting': '正在重新连接…',
   'player.retryingCatchup': '正在重试回看…',
@@ -496,7 +495,6 @@ export const ZH_CN_MESSAGES = {
   'parental.askAfterLeaving': '离开应用后',
   'app.welcome': '欢迎！请添加播放列表网址以开始使用。',
   'app.loadingChannels': '正在加载频道…',
-  'app.loadingChannelsProgress': '正在加载频道… 已处理 {processed}，保留 {kept}',
   'app.channelsLoaded': {
     other: '已加载 {count} 个频道',
   },

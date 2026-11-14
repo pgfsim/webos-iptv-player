@@ -6,7 +6,17 @@
 // site.
 
 export const PLAY_ICON = '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>';
+export const PREVIOUS_EPISODE_ICON = '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M6 6h2v12H6zm3.5 6 8.5 6V6z"/></svg>';
+export const NEXT_EPISODE_ICON = '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M6 18l8.5-6L6 6v12zM16 6v12h2V6h-2z"/></svg>';
 export const PAUSE_ICON = '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M6 5h4v14H6zM14 5h4v14h-4z"/></svg>';
+
+// Play triangle for a channel group without a matching icon. A U+25B6 glyph
+// here forced a fallback-font lookup that stalled the channel list's first
+// paint.
+export const TRIANGLE_ICON = '<svg class="group-fallback-icon" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M7 4v16l14-8z"/></svg>';
+// Marks the playing channel. A U+25B6 glyph here stalled the first layout
+// after leaving the player on the same fallback-font lookup.
+export const PLAYING_ICON = '<svg class="playing-indicator-icon" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M7 4v16l14-8z"/></svg>';
 
 // Magnifier (tab bar search).
 export const SEARCH_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><line x1="16.5" y1="16.5" x2="21" y2="21"/></svg>';
